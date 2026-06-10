@@ -114,11 +114,20 @@ final class CompanionManager: ObservableObject {
     /// object publishes its own state, and the parent exposes the object itself
     /// rather than mirroring every property.
     ///
-    /// U8 will call walkthroughController.apply(event:) as turns complete.
-    /// U9 will read walkthroughController.phase and currentSnapshot for the
-    /// overlay chip and panel controls. This unit (U7) adds the property only —
-    /// handleShortcutTransition wiring is U8's responsibility.
+    /// U8 calls walkthroughController.apply(event:) as turns complete.
+    /// U9 reads walkthroughController.phase and currentSnapshot for the
+    /// overlay chip and panel controls.
     let walkthroughController = WalkthroughController()
+
+    /// The most recently parsed walkthrough step from a Claude response.
+    ///
+    /// Stored so the TTS-completion observer in sendTranscriptToClaudeWithScreenshot
+    /// can fire apply(.stepPresented(step:)) after TTS finishes — the step data
+    /// must survive from parse time (mid-task) to the post-TTS polling loop.
+    ///
+    /// Reset to nil at the start of each new turn so a stale step from a
+    /// previous turn cannot accidentally re-trigger step presentation.
+    private var pendingWalkthroughStepAfterTTS: WalkthroughStep? = nil
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
@@ -549,10 +558,29 @@ final class CompanionManager: ObservableObject {
             // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and TTS from a previous utterance
+            // Cancel any in-progress response and TTS from a previous utterance.
+            // Walkthrough-aware behaviour:
+            //   - PTT is NEVER a cancel for the whole walkthrough (the panel button
+            //     handles cancellation). PTT during a walkthrough routes the utterance
+            //     into the walkthrough context (help or done-signal) — see the routing
+            //     in sendTranscriptToClaudeWithScreenshot.
+            //   - However if a verification turn is currently in flight (phase == .verifying),
+            //     cancelling currentResponseTask means no verdict will arrive. We must
+            //     apply .turnInterrupted so the controller returns to awaitingUserAction
+            //     and the walkthrough is never stranded in .verifying.
+            //   - Step visuals (pointing/annotations for the current step) are owned by
+            //     walkthrough state and should NOT be cleared by PTT mid-walkthrough.
+            //     U9 will scope clearDetectedElementLocation() to non-walkthrough turns;
+            //     for now we call it here unconditionally to preserve existing behaviour.
+            let walkthroughPhaseBeforeCancel = walkthroughController.phase
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
+
+            // After cancelling, notify the controller if a verification turn was interrupted.
+            if walkthroughPhaseBeforeCancel == .verifying {
+                walkthroughController.apply(event: .turnInterrupted)
+            }
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -662,6 +690,20 @@ final class CompanionManager: ObservableObject {
     - user asks a general knowledge question: "the capital of france is paris. [POINT:none]"
 
     you can still include a single POINT at the end to make the cursor fly to the most important element. annotations and POINT work together fine.
+
+    guided walkthroughs:
+    when the user asks to be walked through a multi-step process — like "walk me through enabling dark mode" or "guide me through setting up Wi-Fi" — declare the walkthrough and present only the first step. do not dump all the steps at once.
+
+    declaration: at the very beginning of your response, emit [WALKTHROUGH:<total>] where <total> is the total number of steps. then present step 1 immediately in that same response.
+
+    step format: [STEP:<n>:<short imperative instruction>] — the instruction should be a short action the user can take right now (5-10 words max). include a point or annotation for the step's target element so the user knows exactly where to look.
+
+    example first response for a 3-step walkthrough:
+    "ok, let's do this in three steps. first, open system settings — you'll find it in the apple menu or spotlight. [WALKTHROUGH:3] [STEP:1:Open System Settings] [POINT:E1:System Settings]"
+
+    after each step: wait. the user will signal when they're done (by saying "done", "i did it", "next", etc., or pressing a button in the panel). you'll then receive a fresh screenshot and element inventory to verify whether they succeeded. respond with [VERIFY:done] if the step was completed correctly, or [VERIFY:retry:<specific corrective hint>] if not. if done, present the next step in the same response with [STEP:<n+1>:<instruction>]. if it was the last step, just [VERIFY:done] and a brief congratulations with no new step tag.
+
+    keep walkthrough instructions short and concrete. one action per step. no multi-part steps.
     """
 
     // MARK: - AI Response Pipeline
@@ -671,7 +713,41 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
+    ///
+    /// WALKTHROUGH ROUTING (Phase C, U8)
+    /// ──────────────────────────────────────────────────────────────────────
+    /// When a walkthrough is active (walkthroughController.phase != .inactive),
+    /// the transcript is classified locally before dispatching to Claude:
+    ///
+    ///   - Done-signal ("done", "i did it", "next", etc.) → runWalkthroughVerificationTurn()
+    ///     applies .userSignaledStepDone and starts a verification turn.
+    ///
+    ///   - Everything else → help turn: normal Claude turn with the regular system
+    ///     prompt augmented with current walkthrough context so Claude knows the user
+    ///     is mid-walkthrough and should be returned to the current step after helping.
+    ///     Applies .userAskedForHelp (phase stays awaitingUserAction, no step advance).
+    ///
+    /// When no walkthrough is active the method behaves exactly as before.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+        // Reset the pending step so TTS completion from a previous turn cannot
+        // accidentally fire stepPresented for a stale step.
+        pendingWalkthroughStepAfterTTS = nil
+
+        // --- Walkthrough routing: classify the transcript BEFORE dispatching ---
+        // Only route when a walkthrough is active and the user is awaiting action.
+        // Other phases (presentingStep, verifying) are managed internally.
+        if walkthroughController.phase == .awaitingUserAction {
+            if WalkthroughTagParser.transcriptMatchesDoneSignal(transcript) {
+                // User signalled they completed the step — start verification.
+                runWalkthroughVerificationTurn()
+                return
+            }
+            // Not a done-signal → treat as a help question: fall through to the
+            // normal Claude turn below, but augment the system prompt with walkthrough
+            // context so Claude knows to return the user to the current step after helping.
+            walkthroughController.apply(event: .userAskedForHelp)
+        }
+
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
 
@@ -784,9 +860,29 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
+                // Choose the system prompt. During an active walkthrough help turn
+                // (phase was awaitingUserAction and the transcript was NOT a done-signal),
+                // we augment the base prompt with walkthrough context so Claude knows
+                // the user is mid-walkthrough and should be guided back to the current
+                // step after answering. The help-turn augment is built inline here so
+                // it stays close to the dispatch site and is easy to read.
+                let effectiveSystemPrompt: String = {
+                    let snapshot = walkthroughController.currentSnapshot
+                    guard snapshot.phase == .awaitingUserAction,
+                          !snapshot.declaredSteps.isEmpty else {
+                        return Self.companionVoiceResponseSystemPrompt
+                    }
+                    let currentStepIndex = snapshot.currentStepIndex
+                    let currentInstruction = currentStepIndex < snapshot.declaredSteps.count
+                        ? snapshot.declaredSteps[currentStepIndex].instruction
+                        : ""
+                    let stepContext = "the user is mid-walkthrough (step \(currentStepIndex + 1) of \(snapshot.totalStepCount): \"\(currentInstruction)\"). answer their question, then remind them to go back to the current step when ready. do not advance the walkthrough or emit [STEP:] or [VERIFY:] tags."
+                    return Self.companionVoiceResponseSystemPrompt + "\n\n" + stepContext
+                }()
+
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: effectiveSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     supplementalContextText: supplementalInventoryTextBlock,
@@ -823,6 +919,41 @@ final class CompanionManager: ObservableObject {
                     print("🖼️ Annotations parsed: \(annotationParseResult.annotations.count) shapes")
                 }
 
+                // --- Walkthrough tag parsing (Phase C, U8) ---
+                // Run AFTER annotation stripping and BEFORE the POINT parser so the
+                // parse-order contract is maintained: POINT sees a clean tail free of
+                // all inline tags. The walkthrough tags ([WALKTHROUGH:] and [STEP:])
+                // are stripped here; the stripped text flows into POINT parsing, TTS,
+                // and conversation history.
+                //
+                // Declaration handling: apply .walkthroughDeclared immediately so the
+                // controller moves to presentingStep before we present the step.
+                //
+                // Step handling: store the parsed step in pendingWalkthroughStepAfterTTS.
+                // We apply .stepPresented AFTER TTS finishes (below, in the post-TTS
+                // polling loop) so the phase only reaches awaitingUserAction once the
+                // user has heard the instruction — matching the plan's requirement that
+                // stepPresented fires "after TTS for this turn completes".
+                let walkthroughParseResult = WalkthroughTagParser.parseWalkthroughTags(
+                    from: responseTextAfterAnnotationStripping
+                )
+
+                if let declaration = walkthroughParseResult.declaration {
+                    walkthroughController.apply(event: .walkthroughDeclared(totalStepCount: declaration.totalStepCount))
+                    print("📋 Walkthrough declared: \(declaration.totalStepCount) steps")
+                }
+
+                if let step = walkthroughParseResult.step {
+                    // Store so the post-TTS block below can fire stepPresented once
+                    // the user has heard the instruction.
+                    pendingWalkthroughStepAfterTTS = step
+                    print("📋 Walkthrough step \(step.stepNumber) pending TTS: \"\(step.instruction)\"")
+                }
+
+                // The text with both annotation AND walkthrough tags stripped is what
+                // flows into POINT parsing, TTS, and conversation history.
+                let responseTextAfterWalkthroughStripping = walkthroughParseResult.strippedText
+
                 // --- Annotation resolution (Phase B, U6) ---
                 // Resolve the parsed annotations to exact AppKit-global rects and
                 // publish them so each per-screen BlueCursorView can render its slice.
@@ -850,10 +981,10 @@ final class CompanionManager: ObservableObject {
                     print("🖼️ Annotations resolved: \(resolvedScreenAnnotations.count) shapes ready for overlay")
                 }
 
-                // Parse the [POINT:...] tag from the annotation-stripped response.
-                // Because annotation tags have already been removed, the end-anchor
+                // Parse the [POINT:...] tag from the fully-stripped response text
+                // (annotation tags and walkthrough tags both removed). The end-anchor
                 // regex reliably finds [POINT:...] at the actual end of the text.
-                let parseResult = Self.parsePointingCoordinates(from: responseTextAfterAnnotationStripping)
+                let parseResult = Self.parsePointingCoordinates(from: responseTextAfterWalkthroughStripping)
                 let spokenText = parseResult.spokenText
 
                 // Resolve the pointing instruction to an on-screen location.
@@ -980,6 +1111,36 @@ final class CompanionManager: ObservableObject {
                         speakCreditsErrorFallback()
                     }
                 }
+
+                // --- Post-TTS walkthrough step presentation (Phase C, U8) ---
+                // Wait for TTS to finish playing, then apply .stepPresented so the
+                // controller transitions from presentingStep → awaitingUserAction.
+                // We wait because stepPresented should only fire once the user has
+                // actually heard the instruction — firing earlier would leave the
+                // overlay chip in "awaiting" while TTS is still playing.
+                //
+                // Poll pattern mirrors scheduleTransientHideIfNeeded: 200ms intervals,
+                // task-cancellation checked each iteration so PTT mid-TTS exits cleanly.
+                //
+                // We capture pendingWalkthroughStepAfterTTS into a local so a concurrent
+                // new turn (which resets the property at the top of sendTranscript...)
+                // cannot race this loop.
+                if let stepToPresent = pendingWalkthroughStepAfterTTS {
+                    // Wait for TTS audio to finish before signalling step presented.
+                    while elevenLabsTTSClient.isPlaying {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        guard !Task.isCancelled else { break }
+                    }
+                    if !Task.isCancelled {
+                        pendingWalkthroughStepAfterTTS = nil
+                        walkthroughController.apply(event: .stepPresented(step: WalkthroughStep(
+                            stepNumber: stepToPresent.stepNumber,
+                            instruction: stepToPresent.instruction
+                        )))
+                        print("📋 Walkthrough step \(stepToPresent.stepNumber) presented — now awaitingUserAction")
+                    }
+                }
+
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
@@ -1033,6 +1194,297 @@ final class CompanionManager: ObservableObject {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    // MARK: - Walkthrough Verification Turn
+
+    /// Shared capture helper: runs screenshot capture and AX inventory walk
+    /// concurrently, races the walk against a 1.5s timeout, and returns the
+    /// results. Extracted so the main pipeline and the verification turn share
+    /// one implementation — avoiding duplication of the async let + taskGroup
+    /// race pattern.
+    ///
+    /// Returns (screenCaptures, inventory). On AX walk timeout inventory is nil;
+    /// on screenshot failure the method throws.
+    private func captureScreenshotsAndInventory() async throws -> (
+        screenCaptures: [CompanionScreenCapture],
+        inventory: AccessibilityElementInventory?
+    ) {
+        async let screenCapturesResult = CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+        async let axInventoryResult = AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
+
+        let axInventoryTimeoutInNanoseconds: UInt64 = 1_500_000_000
+
+        let inventoryOrNil: AccessibilityElementInventory? = await withTaskGroup(
+            of: AccessibilityElementInventory?.self
+        ) { group in
+            group.addTask { return await axInventoryResult }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: axInventoryTimeoutInNanoseconds)
+                return nil
+            }
+            let firstResult = await group.next()
+            group.cancelAll()
+            return firstResult ?? nil
+        }
+
+        let screenCaptures = try await screenCapturesResult
+        return (screenCaptures: screenCaptures, inventory: inventoryOrNil)
+    }
+
+    /// Kicks off a walkthrough verification turn.
+    ///
+    /// Called when the user signals step completion (done-signal via PTT or the
+    /// panel "I did it" button). Applies .userSignaledStepDone, captures a fresh
+    /// screenshot + AX inventory (same concurrent race as the main pipeline), sends
+    /// to Claude with the verification system prompt, parses the verdict, and drives
+    /// the controller accordingly.
+    ///
+    /// VERIFY tag handling:
+    ///   - [VERIFY:done]: apply .stepVerifiedDone. The same response may also contain
+    ///     a [STEP:n+1:...] tag for the next step — walkthrough tag parsing handles it.
+    ///   - [VERIFY:retry:hint]: apply .stepNeedsRetry(hint:). The hint is already
+    ///     embedded in the spoken text (it IS the spoken text after tag stripping).
+    ///   - No VERIFY tag (graceful degradation): speak the response as a hint, then
+    ///     apply .turnInterrupted to return from .verifying to .awaitingUserAction.
+    ///     This prevents the walkthrough from being stranded in .verifying when Claude
+    ///     omits the protocol tag (model drift, network truncation, etc.).
+    func runWalkthroughVerificationTurn() {
+        walkthroughController.apply(event: .userSignaledStepDone)
+
+        let snapshot = walkthroughController.currentSnapshot
+        let currentStepIndex = snapshot.currentStepIndex
+        guard currentStepIndex < snapshot.declaredSteps.count else {
+            print("⚠️ Walkthrough: runWalkthroughVerificationTurn called with out-of-bounds step index")
+            walkthroughController.apply(event: .turnInterrupted)
+            return
+        }
+        let currentStep = snapshot.declaredSteps[currentStepIndex]
+        let stepListForPrompt = snapshot.declaredSteps
+
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+        pendingWalkthroughStepAfterTTS = nil
+
+        currentResponseTask = Task {
+            voiceState = .processing
+
+            do {
+                let (screenCaptures, inventory) = try await captureScreenshotsAndInventory()
+
+                guard !Task.isCancelled else { return }
+
+                inventoryForCurrentInteraction = inventory
+
+                let labeledImages = screenCaptures.map { capture in
+                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                }
+
+                let supplementalInventoryTextBlock: String? = Self.buildSupplementalInventoryTextBlock(
+                    inventory: inventory,
+                    cursorScreenCapture: screenCaptures.first(where: { $0.isCursorScreen })
+                )
+
+                let verificationSystemPrompt = Self.walkthroughVerificationSystemPrompt(
+                    stepList: stepListForPrompt,
+                    currentStep: currentStep
+                )
+
+                // Verification turns do NOT use conversationHistory — the full step
+                // context is carried in the system prompt itself (so truncation cannot
+                // lose it). The conversation history window is for user-Claude dialogue;
+                // the verification turn is a protocol exchange, not a conversation turn.
+                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: labeledImages,
+                    systemPrompt: verificationSystemPrompt,
+                    conversationHistory: [],
+                    userPrompt: "please verify whether I completed the current step",
+                    supplementalContextText: supplementalInventoryTextBlock,
+                    onTextChunk: { _ in }
+                )
+
+                guard !Task.isCancelled else { return }
+
+                // --- Parse annotation tags first (same parse-order contract as main pipeline) ---
+                annotationsParsedFromCurrentResponse = []
+                let annotationParseResult = AnnotationTagParser.parseAnnotationTags(from: fullResponseText)
+                annotationsParsedFromCurrentResponse = annotationParseResult.annotations
+                resolvedScreenAnnotations = Self.resolveAnnotationsToScreenRects(
+                    parsedAnnotations: annotationParseResult.annotations,
+                    inventory: inventoryForCurrentInteraction,
+                    screenCaptures: screenCaptures,
+                    allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                )
+
+                // --- Parse walkthrough tags (next step may be in this response) ---
+                let walkthroughParseResult = WalkthroughTagParser.parseWalkthroughTags(
+                    from: annotationParseResult.strippedText
+                )
+                if let nextStep = walkthroughParseResult.step {
+                    pendingWalkthroughStepAfterTTS = nextStep
+                }
+
+                // --- Parse the verification verdict ---
+                let verdictParseResult = WalkthroughTagParser.parseVerificationVerdict(
+                    from: walkthroughParseResult.strippedText
+                )
+
+                // Annotations + walkthrough + verify tags all stripped; POINT still present.
+                let pointParseResult = Self.parsePointingCoordinates(from: verdictParseResult.strippedText)
+                let spokenText = pointParseResult.spokenText
+
+                // --- Resolve pointing for the verification response ---
+                if let targetElementID = pointParseResult.elementID,
+                   let resolvedLocation = Self.resolveElementIDToAppKitCenter(
+                       elementID: targetElementID,
+                       inventory: inventoryForCurrentInteraction,
+                       allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                   ) {
+                    voiceState = .idle
+                    let elementScreenFrame = Self.findScreenFrameContainingOrNearestToPoint(
+                        point: resolvedLocation,
+                        allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                    )
+                    detectedElementScreenLocation = resolvedLocation
+                    detectedElementDisplayFrame = elementScreenFrame
+                    if let label = pointParseResult.elementLabel {
+                        detectedElementBubbleText = label
+                    }
+                } else if let pointCoordinate = pointParseResult.coordinate {
+                    voiceState = .idle
+                    if let capture = screenCaptures.first(where: { $0.isCursorScreen }) {
+                        let globalLocation = ScreenCoordinateConverter.convertScreenshotPixelPointToAppKitGlobalPoint(
+                            screenshotPixelPoint: pointCoordinate,
+                            screenshotWidthInPixels: CGFloat(capture.screenshotWidthInPixels),
+                            screenshotHeightInPixels: CGFloat(capture.screenshotHeightInPixels),
+                            displayWidthInPoints: CGFloat(capture.displayWidthInPoints),
+                            displayHeightInPoints: CGFloat(capture.displayHeightInPoints),
+                            displayFrameInAppKitCoordinates: capture.displayFrame
+                        )
+                        detectedElementScreenLocation = globalLocation
+                        detectedElementDisplayFrame = capture.displayFrame
+                    }
+                }
+
+                // Append the verification exchange to history (stripped text only).
+                // The step list rides in the system prompt for future verification turns
+                // so history truncation is safe.
+                conversationHistory.append((
+                    userTranscript: "done",
+                    assistantResponse: spokenText
+                ))
+                if conversationHistory.count > 10 {
+                    conversationHistory.removeFirst(conversationHistory.count - 10)
+                }
+
+                // --- Apply the verdict to the controller ---
+                switch verdictParseResult.verdict {
+
+                case .done:
+                    // Play TTS first so the user hears the result before the controller
+                    // advances. The next step (if any) is handled by pendingWalkthroughStepAfterTTS.
+                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        do {
+                            try await elevenLabsTTSClient.speakText(spokenText)
+                            voiceState = .responding
+                        } catch {
+                            print("⚠️ Verification TTS error: \(error)")
+                        }
+                    }
+                    let verifyDoneEffect = walkthroughController.apply(event: .stepVerifiedDone)
+                    if verifyDoneEffect == .announceCompletion {
+                        print("📋 Walkthrough complete!")
+                    }
+                    // If there is a next step in this response, wait for TTS to finish
+                    // then apply stepPresented so the controller reaches awaitingUserAction.
+                    if let stepToPresent = pendingWalkthroughStepAfterTTS {
+                        while elevenLabsTTSClient.isPlaying {
+                            try? await Task.sleep(nanoseconds: 200_000_000)
+                            guard !Task.isCancelled else { break }
+                        }
+                        if !Task.isCancelled {
+                            pendingWalkthroughStepAfterTTS = nil
+                            walkthroughController.apply(event: .stepPresented(step: WalkthroughStep(
+                                stepNumber: stepToPresent.stepNumber,
+                                instruction: stepToPresent.instruction
+                            )))
+                            print("📋 Walkthrough step \(stepToPresent.stepNumber) presented after verification")
+                        }
+                    }
+
+                case .retry(let hint):
+                    // Speak the full response (hint already in spokenText after stripping).
+                    // The speakRetryHint effect from the controller is informational here.
+                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        do {
+                            try await elevenLabsTTSClient.speakText(spokenText)
+                            voiceState = .responding
+                        } catch {
+                            print("⚠️ Verification retry TTS error: \(error)")
+                        }
+                    }
+                    walkthroughController.apply(event: .stepNeedsRetry(hint: hint))
+                    print("📋 Walkthrough step retry: \(hint)")
+
+                case nil:
+                    // No [VERIFY:...] tag found — graceful degradation path.
+                    // Speak the response as a plain hint, then apply .turnInterrupted so
+                    // the controller returns from .verifying to .awaitingUserAction.
+                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        do {
+                            try await elevenLabsTTSClient.speakText(spokenText)
+                            voiceState = .responding
+                        } catch {
+                            print("⚠️ Verification (no verdict) TTS error: \(error)")
+                        }
+                    }
+                    walkthroughController.apply(event: .turnInterrupted)
+                    print("📋 Walkthrough: no VERIFY tag — applied turnInterrupted (graceful degradation)")
+                }
+
+            } catch is CancellationError {
+                // PTT pressed during verification — turnInterrupted already applied in
+                // handleShortcutTransition before the task was cancelled.
+            } catch {
+                print("⚠️ Walkthrough verification error: \(error)")
+                walkthroughController.apply(event: .turnInterrupted)
+            }
+
+            if !Task.isCancelled {
+                voiceState = .idle
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
+    /// Cancels the active walkthrough from the panel's Cancel button.
+    ///
+    /// Stops any in-flight TTS and API response, applies .userCancelled to the
+    /// controller (which emits .announceCancellation), and speaks a brief
+    /// acknowledgement via NSSpeechSynthesizer (no API call needed for cancel).
+    ///
+    /// Cancellation via spoken intent is NOT routed here in v1 — the panel button
+    /// is the canonical cancel entry point. Spoken "cancel" utterances during
+    /// awaitingUserAction are treated as help turns. This is documented as a v1
+    /// limitation; v2 could add "cancel" to a separate classifier.
+    func cancelActiveWalkthrough() {
+        guard walkthroughController.phase != .inactive else { return }
+
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+        pendingWalkthroughStepAfterTTS = nil
+
+        let effect = walkthroughController.apply(event: .userCancelled)
+
+        if effect == .announceCancellation {
+            // Speak via system TTS — no API call needed, keeps cancel snappy.
+            let synthesizer = NSSpeechSynthesizer()
+            synthesizer.startSpeaking("ok, walkthrough cancelled")
+        }
+
+        clearDetectedElementLocation()
+        print("📋 Walkthrough cancelled by user")
     }
 
     // MARK: - Point Tag Parsing
@@ -1237,6 +1689,66 @@ final class CompanionManager: ObservableObject {
         let headerLine = "Interactive elements of the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space:"
 
         return "\(headerLine)\n\(formattedElementLines)"
+    }
+
+    // MARK: - Walkthrough Verification System Prompt Builder
+
+    /// Builds the system prompt for a walkthrough verification turn.
+    ///
+    /// A verification turn is a fresh Claude call that receives a new screenshot
+    /// + AX inventory and must return either [VERIFY:done] (step completed) or
+    /// [VERIFY:retry:<hint>] (step not completed). The step list travels in this
+    /// system prompt so conversation-history truncation cannot lose it — the
+    /// history only carries stripped spoken text (10-exchange window), but the
+    /// step context is always present in the system prompt for every verification
+    /// turn regardless of where in the walkthrough we are.
+    ///
+    /// The same casual lowercase voice rules as companionVoiceResponseSystemPrompt
+    /// apply here — responses will be spoken aloud via TTS.
+    ///
+    /// This is a pure static function so it is directly unit-testable without
+    /// constructing a CompanionManager or making any API calls.
+    ///
+    /// - Parameters:
+    ///   - stepList: All steps declared so far in the walkthrough (accumulated in
+    ///     WalkthroughStateSnapshot.declaredSteps). Used to give Claude full context
+    ///     about the overall goal even when verifying a mid-walkthrough step.
+    ///   - currentStep: The step whose completion is being verified in this turn.
+    ///     Its instruction is highlighted explicitly so Claude knows exactly what
+    ///     success looks like.
+    /// - Returns: A system prompt string ready to pass to claudeAPI.analyzeImageStreaming.
+    static func walkthroughVerificationSystemPrompt(
+        stepList: [WalkthroughStep],
+        currentStep: WalkthroughStep
+    ) -> String {
+        // Build a numbered list of all steps for context. Even steps not yet
+        // reached help Claude understand the overall user goal.
+        let stepListText = stepList.enumerated().map { _, step in
+            "  step \(step.stepNumber): \(step.instruction)"
+        }.joined(separator: "\n")
+
+        return """
+        you're clicky, a friendly always-on companion. you're verifying whether the user completed a walkthrough step. you can see their current screen and a live list of interactive elements.
+
+        the full walkthrough:
+        \(stepListText)
+
+        you are verifying step \(currentStep.stepNumber): "\(currentStep.instruction)"
+
+        look at the fresh screenshot and element inventory. did the user complete this step?
+
+        if yes: reply [VERIFY:done] and — unless this was the last step — immediately present the next step with [STEP:\(currentStep.stepNumber + 1):<short instruction>] and a point/annotation. if it was the last step, just [VERIFY:done] and a brief warm congratulations (one sentence, no new step tag).
+
+        if no: reply [VERIFY:retry:<specific corrective hint>] where the hint tells them exactly what to do differently. be specific — "you clicked sharing, go back and pick general" is better than "try again". the hint will be spoken aloud so keep it conversational and under 15 words.
+
+        rules:
+        - always lowercase, casual, warm. no emojis.
+        - write for the ear — this will be spoken via text-to-speech.
+        - the [VERIFY:...] tag can appear anywhere in your response. it does not need to be at the end.
+        - for [VERIFY:retry:<hint>], the hint is everything after the second colon up to the closing bracket. it may contain commas but keep it short.
+        - if you present the next step, follow the same pointing/annotation rules as normal (use element IDs from the inventory when available).
+        - do not say "simply" or "just".
+        """
     }
 
     // MARK: - ResolvedScreenAnnotation
