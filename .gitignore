@@ -7,3 +7,4 @@ releases/
 .claude/
 coding-plans/
 .undo-stack/
+.omc/
