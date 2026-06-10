@@ -172,12 +172,52 @@ final class AccessibilityElementInventoryService: ObservableObject {
 
     /// The single serial queue that owns ALL AXUIElement calls. See the
     /// thread-safety contract at the top of this file.
+    ///
+    /// SHARED QUEUE CONTRACT (Phase D)
+    /// ─────────────────────────────────
+    /// `ActionExecutionService` must perform all its AX calls on THIS queue —
+    /// not a second queue it creates independently. The AX C API is not thread-
+    /// safe; running concurrent AX calls from two different queues (even serial
+    /// ones) violates the single-owner invariant established in Phase A and can
+    /// produce crashes or silent wrong results.
+    ///
+    /// The queue is exposed via `performOnAXSerialQueue(_:)` so callers can
+    /// schedule work on it without gaining direct access to the DispatchQueue
+    /// (which would allow them to bypass `async` ordering guarantees).
     private let axSerialQueue = DispatchQueue(
         label: "com.learningbuddy.ax-serial",
         qos: .userInitiated
     )
 
     private init() {}
+
+    // MARK: - Shared AX queue access (for ActionExecutionService)
+
+    /// Schedules `work` on the single AX serial queue and bridges it back to
+    /// async/await via a checked continuation.
+    ///
+    /// WHY THIS HELPER EXISTS
+    /// ──────────────────────
+    /// `ActionExecutionService` (Phase D) must share the serial AX queue owned
+    /// by this service — one thread must own ALL AX traffic. Rather than
+    /// exposing the raw `DispatchQueue` (which would let callers call
+    /// `axSerialQueue.sync { }` and potentially deadlock), this helper
+    /// schedules an async dispatch and returns via continuation.
+    ///
+    /// The generic `T` covers both `ActionExecutionResult` and any intermediate
+    /// value the execution service needs to compute on the AX thread.
+    ///
+    /// - Parameter work: A closure that runs synchronously on the AX serial
+    ///   queue and returns a value of type `T`.
+    /// - Returns: The value returned by `work`.
+    func performOnAXSerialQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            axSerialQueue.async {
+                let result = work()
+                continuation.resume(returning: result)
+            }
+        }
+    }
 
     // MARK: - Public API
 

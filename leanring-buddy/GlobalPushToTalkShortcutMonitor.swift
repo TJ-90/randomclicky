@@ -108,6 +108,19 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             return Unmanaged.passUnretained(event)
         }
 
+        // Ignore synthetic events posted by ActionExecutionService.
+        // Without this guard the HID-level mouse-moved event that precedes a
+        // synthetic click would be seen by this tap. If the user is currently
+        // holding the push-to-talk shortcut, that stray event could cause a
+        // spurious shortcut transition. More importantly, the user-activity
+        // sampler inside ActionExecutionService watches HID event counters to
+        // pause while the user is typing/moving; without this tag the service's
+        // own mouse-moved event would reset that counter and make the pause
+        // logic incorrectly believe the user is active, triggering a self-stall.
+        if ActionExecutionService.isClickySyntheticEvent(event) {
+            return Unmanaged.passUnretained(event)
+        }
+
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
             for: eventType,
