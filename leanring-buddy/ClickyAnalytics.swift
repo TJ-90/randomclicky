@@ -95,11 +95,71 @@ enum ClickyAnalytics {
         ])
     }
 
-    /// Claude's response included a [POINT:x,y:label] coordinate tag,
-    /// so the buddy is flying to point at a UI element.
-    static func trackElementPointed(elementLabel: String?) {
+    // MARK: - AX Inventory
+
+    /// Describes how an element-pointing instruction was resolved, distinguishing
+    /// accurate element-ID resolution from the pixel-coordinate fallback path.
+    enum ElementPointingMethod: String {
+        /// Claude referenced an element by inventory ID (E<n>) and it was found
+        /// in the captured inventory — the cursor will land on the exact center.
+        case elementIDResolved = "element_id_resolved"
+
+        /// Claude referenced an element by inventory ID but the ID was not in
+        /// the inventory (unknown ID, capped list, or hallucinated ID). The cursor
+        /// does not fly anywhere for this turn.
+        case elementIDLookupFailed = "element_id_lookup_failed"
+
+        /// Claude used the legacy pixel-coordinate form [POINT:x,y:label:screenN].
+        /// This is the fallback for AX-less apps (games, video) and any target
+        /// not in the inventory.
+        case pixelCoordinateFallback = "pixel_coordinate_fallback"
+    }
+
+    /// Claude's response included a [POINT:...] tag, so the buddy is (or is
+    /// trying to) fly to a UI element. The `pointingMethod` distinguishes
+    /// grounded element-ID resolution from the pixel fallback so we can measure
+    /// how often AX grounding is actually providing value.
+    static func trackElementPointed(
+        elementLabel: String?,
+        pointingMethod: ElementPointingMethod
+    ) {
         PostHogSDK.shared.capture("element_pointed", properties: [
-            "element_label": elementLabel ?? "unknown"
+            "element_label": elementLabel ?? "unknown",
+            "pointing_method": pointingMethod.rawValue
+        ])
+    }
+
+    /// Fired after the AX element walk completes (or times out) for one interaction.
+    /// Tracks walk quality metrics so we can tune the timeout and element cap.
+    ///
+    /// - Parameters:
+    ///   - elementCount: The number of actionable elements kept in the inventory.
+    ///     Zero when the walk timed out, returned an empty tree, or AX is unavailable.
+    ///   - captureOutcome: Why the walk produced its result (captured / timedOut /
+    ///     emptyTree / permissionUnavailable).
+    ///   - frontmostAppName: The localized display name of the frontmost application
+    ///     at walk time. Useful for spotting which apps time out or return stub trees.
+    static func trackAXInventoryWalkCompleted(
+        elementCount: Int,
+        captureOutcome: AccessibilityInventoryCaptureOutcome,
+        frontmostAppName: String
+    ) {
+        let outcomeString: String
+        switch captureOutcome {
+        case .captured:
+            outcomeString = "captured"
+        case .timedOut:
+            outcomeString = "timed_out"
+        case .emptyTree:
+            outcomeString = "empty_tree"
+        case .permissionUnavailable:
+            outcomeString = "permission_unavailable"
+        }
+
+        PostHogSDK.shared.capture("ax_inventory_walk_completed", properties: [
+            "element_count": elementCount,
+            "capture_outcome": outcomeString,
+            "frontmost_app_name": frontmostAppName
         ])
     }
 

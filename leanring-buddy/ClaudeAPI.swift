@@ -44,11 +44,15 @@ class ClaudeAPI {
         return request
     }
 
-    /// Detects the MIME type of image data by inspecting the first bytes.
-    /// Screen captures from ScreenCaptureKit are JPEG, but pasted images from the
-    /// clipboard are PNG. The API rejects requests where the declared media_type
-    /// doesn't match the actual image format.
+    /// Instance method — delegates to the static version so detection logic lives in one place.
     private func detectImageMediaType(for imageData: Data) -> String {
+        return Self.detectImageMediaTypeStatic(for: imageData)
+    }
+
+    /// Static MIME-type detection used by `buildContentBlocks` (a static function that
+    /// cannot call instance methods). Detects by inspecting the first bytes of the data.
+    /// Screen captures from ScreenCaptureKit are JPEG; pasted clipboard images are PNG.
+    static func detectImageMediaTypeStatic(for imageData: Data) -> String {
         // PNG files start with the 8-byte signature: 89 50 4E 47 0D 0A 1A 0A
         if imageData.count >= 4 {
             let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47]
@@ -95,14 +99,89 @@ class ClaudeAPI {
         }.resume()
     }
 
+    // MARK: - Content block builder
+
+    /// Builds the array of content blocks for a user message, following the
+    /// canonical ordering: images (each followed by its label) → optional
+    /// supplemental context (AX element inventory) → user prompt.
+    ///
+    /// This is a pure static function so it is unit-testable without a ClaudeAPI
+    /// instance and without making any network calls. The message shape when
+    /// `supplementalContextText` is nil is bit-identical to the pre-U4 shape.
+    ///
+    /// - Parameters:
+    ///   - images: Labeled screenshot data.
+    ///   - supplementalContextText: Optional AX inventory text. When non-nil, a
+    ///     text content block is inserted after the image blocks and before the
+    ///     user prompt. When nil, no extra block is added.
+    ///   - userPrompt: The user's transcript or question.
+    /// - Returns: An array of content-block dictionaries ready to embed in a
+    ///   Claude API message object.
+    static func buildContentBlocks(
+        images: [(data: Data, label: String)],
+        supplementalContextText: String?,
+        userPrompt: String
+    ) -> [[String: Any]] {
+        var contentBlocks: [[String: Any]] = []
+
+        // Add each screenshot as an image block followed by its dimension label.
+        // The label teaches Claude the pixel coordinate space for that image.
+        for image in images {
+            contentBlocks.append([
+                "type": "image",
+                "source": [
+                    "type": "base64",
+                    "media_type": ClaudeAPI.detectImageMediaTypeStatic(for: image.data),
+                    "data": image.data.base64EncodedString()
+                ]
+            ])
+            contentBlocks.append([
+                "type": "text",
+                "text": image.label
+            ])
+        }
+
+        // If an AX inventory is available, inject it as an additional text block
+        // after the images and before the user's question. Claude sees the element
+        // list in context with the screenshots so it can cross-check vision against
+        // structure. When no inventory is present this block is simply absent —
+        // the message shape is identical to before U4.
+        if let supplementalContextText {
+            contentBlocks.append([
+                "type": "text",
+                "text": supplementalContextText
+            ])
+        }
+
+        // The user's actual question or transcript goes last.
+        contentBlocks.append([
+            "type": "text",
+            "text": userPrompt
+        ])
+
+        return contentBlocks
+    }
+
     /// Send a vision request to Claude with streaming.
     /// Calls `onTextChunk` on the main actor each time new text arrives so the UI updates progressively.
     /// Returns the full accumulated text and total duration when the stream completes.
+    ///
+    /// - Parameters:
+    ///   - images: Labeled screenshot image data. Each image is followed by its label as a text block.
+    ///   - systemPrompt: The system prompt sent at the top of the request.
+    ///   - conversationHistory: Prior exchange pairs for multi-turn context.
+    ///   - userPrompt: The user's current question / transcript.
+    ///   - supplementalContextText: Optional additional text block appended AFTER all image blocks
+    ///     and BEFORE the user prompt. Used to inject the AX element inventory so Claude can
+    ///     reference element IDs for grounded pointing. Pass nil (the default) when no inventory
+    ///     is available — the message shape is then identical to before this parameter was added.
+    ///   - onTextChunk: Called on the main actor each time a new chunk of text arrives.
     func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
         userPrompt: String,
+        supplementalContextText: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
@@ -117,26 +196,16 @@ class ClaudeAPI {
             messages.append(["role": "assistant", "content": assistantResponse])
         }
 
-        // Build current message with all labeled images + prompt
-        var contentBlocks: [[String: Any]] = []
-        for image in images {
-            contentBlocks.append([
-                "type": "image",
-                "source": [
-                    "type": "base64",
-                    "media_type": detectImageMediaType(for: image.data),
-                    "data": image.data.base64EncodedString()
-                ]
-            ])
-            contentBlocks.append([
-                "type": "text",
-                "text": image.label
-            ])
-        }
-        contentBlocks.append([
-            "type": "text",
-            "text": userPrompt
-        ])
+        // Build current message content blocks.
+        // Order: image blocks (each followed by its label) → optional supplemental
+        // context block (AX inventory) → user prompt.
+        // This ordering ensures Claude sees the images first, then the structured
+        // element list that grounds element-ID references, then the question.
+        let contentBlocks = Self.buildContentBlocks(
+            images: images,
+            supplementalContextText: supplementalContextText,
+            userPrompt: userPrompt
+        )
         messages.append(["role": "user", "content": contentBlocks])
 
         let body: [String: Any] = [
@@ -228,26 +297,13 @@ class ClaudeAPI {
             messages.append(["role": "assistant", "content": assistantResponse])
         }
 
-        // Build current message with all labeled images + prompt
-        var contentBlocks: [[String: Any]] = []
-        for image in images {
-            contentBlocks.append([
-                "type": "image",
-                "source": [
-                    "type": "base64",
-                    "media_type": detectImageMediaType(for: image.data),
-                    "data": image.data.base64EncodedString()
-                ]
-            ])
-            contentBlocks.append([
-                "type": "text",
-                "text": image.label
-            ])
-        }
-        contentBlocks.append([
-            "type": "text",
-            "text": userPrompt
-        ])
+        // Build current message content blocks using the shared builder.
+        // No supplemental context for non-streaming validation requests.
+        let contentBlocks = Self.buildContentBlocks(
+            images: images,
+            supplementalContextText: nil,
+            userPrompt: userPrompt
+        )
         messages.append(["role": "user", "content": contentBlocks])
 
         let body: [String: Any] = [

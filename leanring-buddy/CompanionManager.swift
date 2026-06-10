@@ -579,10 +579,19 @@ final class CompanionManager: ObservableObject {
 
     if pointing wouldn't help, append [POINT:none].
 
+    grounded pointing with element IDs:
+    sometimes you'll receive a section titled "interactive elements of the frontmost app" before your question. this is a live inventory of UI elements with exact frames in the same pixel coordinate space as the screenshots. when this list is present, PREFER the element-ID form over pixel coordinates — it resolves to the exact center of the element on screen and is more accurate than estimating from a screenshot.
+
+    element-ID form: [POINT:E<id>:label] where <id> is the number from the inventory (e.g. [POINT:E12:submit button]). use the ID of the element you want the cursor to fly to. the frames in the list are in the same pixel space as the screenshots, so you can cross-check them visually. only use element IDs from the current list — IDs change between turns.
+
+    fall back to the pixel-coordinate form [POINT:x,y:label:screenN] only for targets that are not in the inventory (off-screen elements, games, video content, or anything the list doesn't include). keep [POINT:none] for turns where pointing wouldn't help.
+
     examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
+    - inventory present, user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. [POINT:E7:color inspector]"
+    - inventory present, user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c. [POINT:E3:source control]"
+    - no inventory (or target not in list): "you'll want to open the color inspector — it's right up in the top right area of the toolbar. [POINT:1100,42:color inspector]"
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
+    - user asks how to commit in xcode (no inventory): "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
@@ -602,10 +611,81 @@ final class CompanionManager: ObservableObject {
             voiceState = .processing
 
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                // Run screenshot capture and the AX element walk concurrently so
+                // neither blocks the other. The AX walk is raced against a 1.5s
+                // timeout: if it cannot finish in time this turn proceeds with NO
+                // inventory rather than delaying the interaction. The walk continues
+                // in the background (warming Electron trees and completing into
+                // mostRecentCompletedInventory) so the next turn's fresh walk can
+                // finish inside the budget — at most one turn is un-grounded after
+                // a slow app. A previous turn's inventory is never sent for the
+                // current turn: its frames describe a screen state that may no
+                // longer match the screenshot, and the E-id resolver only resolves
+                // against the inventory captured for this interaction.
+                async let screenCapturesResult = CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                async let axInventoryResult = AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
+
+                // Race the AX walk against a 1.5s deadline. On timeout we synthesise
+                // a .timedOut outcome so analytics can track the miss separately from
+                // an empty tree. The walk itself keeps running and will complete into
+                // mostRecentCompletedInventory for the next turn.
+                let axInventoryTimeoutInNanoseconds: UInt64 = 1_500_000_000
+                let completedInventoryOrNil: AccessibilityElementInventory?
+                let axWalkOutcomeForAnalytics: AccessibilityInventoryCaptureOutcome
+
+                do {
+                    // withTaskGroup lets us race the real walk against a sleep.
+                    // The first to finish wins; we cancel the other branch.
+                    let raceResult = await withTaskGroup(
+                        of: AccessibilityElementInventory?.self
+                    ) { group in
+                        group.addTask {
+                            return await axInventoryResult
+                        }
+                        group.addTask {
+                            try? await Task.sleep(nanoseconds: axInventoryTimeoutInNanoseconds)
+                            // Return nil to signal timeout — the winner check below
+                            // distinguishes a real inventory from this nil sentinel.
+                            return nil
+                        }
+                        // Take the first result; cancel the remaining branch.
+                        let firstResult = await group.next()
+                        group.cancelAll()
+                        return firstResult ?? nil
+                    }
+
+                    if let inventoryFromRace = raceResult {
+                        // Walk finished before the timeout — use the real result
+                        completedInventoryOrNil = inventoryFromRace
+                        axWalkOutcomeForAnalytics = inventoryFromRace.captureOutcome
+                    } else {
+                        // Timeout branch won — proceed without a live inventory for
+                        // this turn. The background walk will still complete and update
+                        // mostRecentCompletedInventory for the next turn.
+                        completedInventoryOrNil = nil
+                        axWalkOutcomeForAnalytics = .timedOut
+                    }
+                }
+
+                // Assign the resolved inventory so response-parsing code in this
+                // same file can look up element IDs against it.
+                inventoryForCurrentInteraction = completedInventoryOrNil
+
+                // Capture the screen captures result (may throw)
+                let screenCaptures = try await screenCapturesResult
 
                 guard !Task.isCancelled else { return }
+
+                // Track the AX walk outcome in analytics — this lets us measure
+                // how often inventory is available vs timed out vs absent.
+                let frontmostAppNameForAnalytics = completedInventoryOrNil?.frontmostAppName
+                    ?? AccessibilityElementInventoryService.shared.mostRecentCompletedInventory?.frontmostAppName
+                    ?? ""
+                ClickyAnalytics.trackAXInventoryWalkCompleted(
+                    elementCount: completedInventoryOrNil?.elements.count ?? 0,
+                    captureOutcome: axWalkOutcomeForAnalytics,
+                    frontmostAppName: frontmostAppNameForAnalytics
+                )
 
                 // Build image labels with the actual screenshot pixel dimensions
                 // so Claude's coordinate space matches the image it sees. We
@@ -614,6 +694,21 @@ final class CompanionManager: ObservableObject {
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
+
+                // Build the supplemental AX inventory text block if an inventory
+                // is available. The inventory is frontmost-window-only; screenshots
+                // remain all-displays so the two data sources naturally complement
+                // each other. We use the cursor screen's capture dimensions to put
+                // element frames in the same pixel space as the images.
+                //
+                // Only the inventory captured for THIS interaction is ever sent.
+                // A previous turn's inventory would advertise element IDs the
+                // resolver cannot resolve (inventoryForCurrentInteraction is nil
+                // on timeout) and frames that may not match the screenshot.
+                let supplementalInventoryTextBlock: String? = Self.buildSupplementalInventoryTextBlock(
+                    inventory: completedInventoryOrNil,
+                    cursorScreenCapture: screenCaptures.first(where: { $0.isCursorScreen })
+                )
 
                 // Pass conversation history so Claude remembers prior exchanges
                 let historyForAPI = conversationHistory.map { entry in
@@ -625,6 +720,7 @@ final class CompanionManager: ObservableObject {
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
+                    supplementalContextText: supplementalInventoryTextBlock,
                     onTextChunk: { _ in
                         // No streaming text display — spinner stays until TTS plays
                     }
@@ -667,10 +763,17 @@ final class CompanionManager: ObservableObject {
                         if let label = parseResult.elementLabel {
                             detectedElementBubbleText = label
                         }
-                        ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                        ClickyAnalytics.trackElementPointed(
+                            elementLabel: parseResult.elementLabel,
+                            pointingMethod: .elementIDResolved
+                        )
                         print("🎯 Element pointing: E\(targetElementID) → (\(Int(resolvedLocation.x)), \(Int(resolvedLocation.y))) \"\(parseResult.elementLabel ?? "element")\"")
                     } else {
                         // Unknown ID or no inventory — behave like [POINT:none]: just speak, no point
+                        ClickyAnalytics.trackElementPointed(
+                            elementLabel: parseResult.elementLabel,
+                            pointingMethod: .elementIDLookupFailed
+                        )
                         print("🎯 Element pointing: E\(targetElementID) not found in inventory — speaking without pointing")
                     }
                 } else {
@@ -714,7 +817,10 @@ final class CompanionManager: ObservableObject {
 
                         detectedElementScreenLocation = globalLocation
                         detectedElementDisplayFrame = displayFrame
-                        ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                        ClickyAnalytics.trackElementPointed(
+                            elementLabel: parseResult.elementLabel,
+                            pointingMethod: .pixelCoordinateFallback
+                        )
                         print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                     } else {
                         print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
@@ -946,6 +1052,67 @@ final class CompanionManager: ObservableObject {
             screenNumber: nil,
             elementID: nil
         )
+    }
+
+    // MARK: - Supplemental Inventory Text Block Builder
+
+    /// Builds the supplemental AX inventory text block to append to a Claude message,
+    /// or returns nil when no inventory is available.
+    ///
+    /// The block consists of:
+    ///   1. A one-line header naming the frontmost app and describing the coordinate
+    ///      space so Claude can cross-check the list against the screenshot images.
+    ///   2. The formatted element lines from `AccessibilityElementInventoryService.formatInventoryForPrompt`.
+    ///
+    /// Returns nil when:
+    ///   - `inventory` is nil (no walk completed in time and no previous walk is cached)
+    ///   - The inventory's element list is empty (stub AX tree, AX-less app)
+    ///
+    /// Returning nil results in a message shape identical to before U4 — no extra
+    /// block is added, so legacy behaviour is fully preserved for AX-less apps.
+    ///
+    /// This is a pure static function so it is directly unit-testable without
+    /// constructing a CompanionManager or making any API calls.
+    ///
+    /// - Parameters:
+    ///   - inventory: The AX inventory to format, or nil when none is available.
+    ///   - cursorScreenCapture: The screen capture for the display where the
+    ///     cursor lives. Its pixel dimensions are used to convert element AppKit
+    ///     frames to the same coordinate space as the screenshot images. When nil
+    ///     (no cursor-screen capture found) the function returns nil — without
+    ///     the pixel dimensions we cannot guarantee the coordinate spaces match.
+    /// - Returns: A formatted multi-line string ready to inject as a supplemental
+    ///   text block, or nil when no inventory is available.
+    static func buildSupplementalInventoryTextBlock(
+        inventory: AccessibilityElementInventory?,
+        cursorScreenCapture: CompanionScreenCapture?
+    ) -> String? {
+        guard let inventory,
+              !inventory.elements.isEmpty,
+              let cursorCapture = cursorScreenCapture else {
+            // No inventory, empty tree, or no cursor-screen capture —
+            // return nil so no extra block is added to the message.
+            return nil
+        }
+
+        let formattedElementLines = AccessibilityElementInventoryService.formatInventoryForPrompt(
+            elements: inventory.elements,
+            screenshotWidthInPixels: cursorCapture.screenshotWidthInPixels,
+            screenshotHeightInPixels: cursorCapture.screenshotHeightInPixels,
+            displayFrameInAppKitCoordinates: cursorCapture.displayFrame
+        )
+
+        guard !formattedElementLines.isEmpty else {
+            // formatInventoryForPrompt returns an empty string for an empty list —
+            // guard here in case the element list became empty after filtering.
+            return nil
+        }
+
+        // Header line names the app and states the coordinate space so Claude
+        // knows these frames are in the same pixel space as the screenshots.
+        let headerLine = "Interactive elements of the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space:"
+
+        return "\(headerLine)\n\(formattedElementLines)"
     }
 
     // MARK: - Element-ID Resolution Helpers
