@@ -42,6 +42,16 @@ final class CompanionManager: ObservableObject {
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
 
+    /// The AX element inventory that was available when the current interaction
+    /// was dispatched to Claude. Used during response parsing to resolve
+    /// [POINT:E<id>:...] element-ID tags to exact screen coordinates.
+    ///
+    /// Set to nil here as a placeholder — U4 wires the actual inventory capture
+    /// (screenshot + AX walk run concurrently before the Claude API call).
+    /// The property is non-private so resolution logic in the same file can read it
+    /// without needing a separate accessor.
+    var inventoryForCurrentInteraction: AccessibilityElementInventory? = nil
+
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
     @Published var onboardingVideoPlayer: AVPlayer?
@@ -626,49 +636,89 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
-                }
+                // Resolve the pointing instruction to an on-screen location.
+                // Three branches:
+                //   1. Element-ID form [POINT:E<id>:...]: look up the element in the
+                //      inventory captured for this interaction. If found, publish the
+                //      element's AppKit-space center directly — no screenshot-pixel
+                //      scaling needed. If not found (nil inventory or unknown ID),
+                //      behave like [POINT:none]: speak the response, no pointing, never
+                //      a (0,0) point.
+                //   2. Pixel-coordinate form [POINT:x,y:...]: use the existing
+                //      ScreenCoordinateConverter path, unchanged.
+                //   3. [POINT:none] or no tag: no pointing.
+                if let targetElementID = parseResult.elementID {
+                    // Branch 1: element-ID resolution
+                    if let resolvedLocation = Self.resolveElementIDToAppKitCenter(
+                        elementID: targetElementID,
+                        inventory: inventoryForCurrentInteraction,
+                        allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                    ) {
+                        // Switch to idle so the triangle is visible before the flight animation
+                        voiceState = .idle
 
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
+                        let elementScreenFrame = Self.findScreenFrameContainingOrNearestToPoint(
+                            point: resolvedLocation,
+                            allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                        )
+
+                        detectedElementScreenLocation = resolvedLocation
+                        detectedElementDisplayFrame = elementScreenFrame
+                        if let label = parseResult.elementLabel {
+                            detectedElementBubbleText = label
+                        }
+                        ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                        print("🎯 Element pointing: E\(targetElementID) → (\(Int(resolvedLocation.x)), \(Int(resolvedLocation.y))) \"\(parseResult.elementLabel ?? "element")\"")
+                    } else {
+                        // Unknown ID or no inventory — behave like [POINT:none]: just speak, no point
+                        print("🎯 Element pointing: E\(targetElementID) not found in inventory — speaking without pointing")
                     }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    // ScreenCoordinateConverter handles clamping, ratio-scaling, Y-flip,
-                    // and displayFrame.origin offset in one place so this logic is not
-                    // duplicated between the main pipeline and the onboarding demo.
-                    let displayFrame = targetScreenCapture.displayFrame
-                    let globalLocation = ScreenCoordinateConverter.convertScreenshotPixelPointToAppKitGlobalPoint(
-                        screenshotPixelPoint: pointCoordinate,
-                        screenshotWidthInPixels: CGFloat(targetScreenCapture.screenshotWidthInPixels),
-                        screenshotHeightInPixels: CGFloat(targetScreenCapture.screenshotHeightInPixels),
-                        displayWidthInPoints: CGFloat(targetScreenCapture.displayWidthInPoints),
-                        displayHeightInPoints: CGFloat(targetScreenCapture.displayHeightInPoints),
-                        displayFrameInAppKitCoordinates: displayFrame
-                    )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    // Branch 2 or 3: legacy pixel-coordinate form or [POINT:none] / no tag
+
+                    // Switch to idle BEFORE setting the location so the triangle
+                    // becomes visible and can fly to the target. Without this, the
+                    // spinner hides the triangle and the flight animation is invisible.
+                    let hasPointCoordinate = parseResult.coordinate != nil
+                    if hasPointCoordinate {
+                        voiceState = .idle
+                    }
+
+                    // Pick the screen capture matching Claude's screen number,
+                    // falling back to the cursor screen if not specified.
+                    let targetScreenCapture: CompanionScreenCapture? = {
+                        if let screenNumber = parseResult.screenNumber,
+                           screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                            return screenCaptures[screenNumber - 1]
+                        }
+                        return screenCaptures.first(where: { $0.isCursorScreen })
+                    }()
+
+                    if let pointCoordinate = parseResult.coordinate,
+                       let targetScreenCapture {
+                        // Claude's coordinates are in the screenshot's pixel space
+                        // (top-left origin, e.g. 1280x831). Scale to the display's
+                        // point space (e.g. 1512x982), then convert to AppKit global coords.
+                        // ScreenCoordinateConverter handles clamping, ratio-scaling, Y-flip,
+                        // and displayFrame.origin offset in one place so this logic is not
+                        // duplicated between the main pipeline and the onboarding demo.
+                        let displayFrame = targetScreenCapture.displayFrame
+                        let globalLocation = ScreenCoordinateConverter.convertScreenshotPixelPointToAppKitGlobalPoint(
+                            screenshotPixelPoint: pointCoordinate,
+                            screenshotWidthInPixels: CGFloat(targetScreenCapture.screenshotWidthInPixels),
+                            screenshotHeightInPixels: CGFloat(targetScreenCapture.screenshotHeightInPixels),
+                            displayWidthInPoints: CGFloat(targetScreenCapture.displayWidthInPoints),
+                            displayHeightInPoints: CGFloat(targetScreenCapture.displayHeightInPoints),
+                            displayFrameInAppKitCoordinates: displayFrame
+                        )
+
+                        detectedElementScreenLocation = globalLocation
+                        detectedElementDisplayFrame = displayFrame
+                        ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+                        print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    } else {
+                        print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    }
                 }
 
                 // Save this exchange to conversation history (with the point tag
@@ -761,55 +811,265 @@ final class CompanionManager: ObservableObject {
     struct PointingParseResult {
         /// The response text with the [POINT:...] tag removed — this is what gets spoken.
         let spokenText: String
-        /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
+        /// The parsed pixel coordinate from a [POINT:x,y:...] tag, or nil when an
+        /// element-ID tag is used or Claude said "none" or no tag was found.
         let coordinate: CGPoint?
         /// Short label describing the element (e.g. "run button"), or "none".
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
+        /// Only populated for the legacy pixel-coordinate form.
         let screenNumber: Int?
+        /// The AX element ID parsed from a [POINT:E<digits>:...] tag (e.g. 12 for E12),
+        /// or nil when the legacy pixel-coordinate or [POINT:none] form was used.
+        let elementID: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
-    /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
+    /// Parses a [POINT:...] tag from the end of Claude's response. Supports three forms:
+    ///
+    ///   [POINT:x,y:label:screenN]   — legacy pixel-coordinate form (R3 fallback)
+    ///   [POINT:E<digits>:label]     — element-ID form (R2 grounded pointing)
+    ///   [POINT:none]                — no pointing
+    ///
+    /// The tag must appear at the very end of the response (end-anchored) so that a
+    /// stray "[POINT:..." inside spoken text is never mistaken for a pointing instruction.
+    ///
+    /// Returns the spoken text with the tag stripped plus the parsed pointing data.
+    ///
+    /// LEGACY REGEX BEHAVIOR (hard regression boundary)
+    /// ─────────────────────────────────────────────────
+    /// The legacy regex accepts:
+    ///   - [POINT:none]                 → coordinate nil, elementLabel "none"
+    ///   - [POINT:123,456]              → coordinate (123,456), label nil
+    ///   - [POINT:123,456:label]        → coordinate (123,456), label "label"
+    ///   - [POINT:123,456:label:screen2]→ coordinate (123,456), label "label", screen 2
+    /// The label capture group [^\]:\s][^\]:]*? means the label must not start with
+    /// whitespace or ':' or ']', and must not contain ']' or ':'. This rejects e.g.
+    /// [POINT:abc] (no comma → falls to "none" branch → also no x/y → returns none-result).
+    /// A tag NOT at the end (e.g. mid-sentence) is silently ignored.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
-        let pattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
 
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
-            // No tag found at all
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil)
+        // --- Step 1: Try the legacy pixel-coordinate / none form (end-anchored) ---
+        // Matches [POINT:none] OR [POINT:123,456:optional-label:optional-screenN]
+        let legacyPattern = #"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"#
+
+        if let legacyRegex = try? NSRegularExpression(pattern: legacyPattern, options: []),
+           let match = legacyRegex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) {
+
+            // Remove the tag from spoken text
+            let tagRange = Range(match.range, in: responseText)!
+            let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Determine if it matched [POINT:none] or the pixel-coordinate form.
+            // Capture group 1 (x) and group 2 (y) are nil for the [POINT:none] branch.
+            guard match.numberOfRanges >= 3,
+                  let xRange = Range(match.range(at: 1), in: responseText),
+                  let yRange = Range(match.range(at: 2), in: responseText),
+                  let x = Double(responseText[xRange]),
+                  let y = Double(responseText[yRange]) else {
+                // [POINT:none] branch — no coordinate, no element ID
+                return PointingParseResult(
+                    spokenText: spokenText,
+                    coordinate: nil,
+                    elementLabel: "none",
+                    screenNumber: nil,
+                    elementID: nil
+                )
+            }
+
+            var elementLabel: String? = nil
+            if match.numberOfRanges >= 4, let labelRange = Range(match.range(at: 3), in: responseText) {
+                elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+            }
+
+            var screenNumber: Int? = nil
+            if match.numberOfRanges >= 5, let screenRange = Range(match.range(at: 4), in: responseText) {
+                screenNumber = Int(responseText[screenRange])
+            }
+
+            return PointingParseResult(
+                spokenText: spokenText,
+                coordinate: CGPoint(x: x, y: y),
+                elementLabel: elementLabel,
+                screenNumber: screenNumber,
+                elementID: nil
+            )
         }
 
-        // Remove the tag from the spoken text
-        let tagRange = Range(match.range, in: responseText)!
-        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        // --- Step 2: Try the element-ID form [POINT:E<digits>] or [POINT:E<digits>:label] ---
+        // End-anchored just like the legacy form. The label may contain spaces but
+        // not ']' (which would close the tag). No screenN suffix — element IDs resolve
+        // to the element's own screen via inventory lookup, no screen hint needed.
+        let elementIDPattern = #"\[POINT:E(\d+)(?::([^\]]*))?\]\s*$"#
 
-        // Check if it's [POINT:none]
-        guard match.numberOfRanges >= 3,
-              let xRange = Range(match.range(at: 1), in: responseText),
-              let yRange = Range(match.range(at: 2), in: responseText),
-              let x = Double(responseText[xRange]),
-              let y = Double(responseText[yRange]) else {
-            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil)
+        if let elementIDRegex = try? NSRegularExpression(pattern: elementIDPattern, options: []),
+           let match = elementIDRegex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) {
+
+            // Remove the tag from spoken text
+            let tagRange = Range(match.range, in: responseText)!
+            let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Capture group 1 is always present when this branch matches (it's the \d+ digits)
+            guard let idRange = Range(match.range(at: 1), in: responseText),
+                  let parsedElementID = Int(responseText[idRange]) else {
+                // Malformed — treat as no tag
+                return PointingParseResult(
+                    spokenText: responseText,
+                    coordinate: nil,
+                    elementLabel: nil,
+                    screenNumber: nil,
+                    elementID: nil
+                )
+            }
+
+            var elementLabel: String? = nil
+            if match.numberOfRanges >= 3, let labelRange = Range(match.range(at: 2), in: responseText) {
+                let trimmedLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+                if !trimmedLabel.isEmpty {
+                    elementLabel = trimmedLabel
+                }
+            }
+
+            return PointingParseResult(
+                spokenText: spokenText,
+                coordinate: nil,
+                elementLabel: elementLabel,
+                screenNumber: nil,
+                elementID: parsedElementID
+            )
         }
 
-        var elementLabel: String? = nil
-        if match.numberOfRanges >= 4, let labelRange = Range(match.range(at: 3), in: responseText) {
-            elementLabel = String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
-        }
-
-        var screenNumber: Int? = nil
-        if match.numberOfRanges >= 5, let screenRange = Range(match.range(at: 4), in: responseText) {
-            screenNumber = Int(responseText[screenRange])
-        }
-
+        // --- Step 3: No recognised tag found ---
         return PointingParseResult(
-            spokenText: spokenText,
-            coordinate: CGPoint(x: x, y: y),
-            elementLabel: elementLabel,
-            screenNumber: screenNumber
+            spokenText: responseText,
+            coordinate: nil,
+            elementLabel: nil,
+            screenNumber: nil,
+            elementID: nil
         )
+    }
+
+    // MARK: - Element-ID Resolution Helpers
+
+    /// Looks up an element ID in the given inventory and returns the element's
+    /// center point in AppKit global coordinates, or nil if the inventory is nil
+    /// or the ID is not found.
+    ///
+    /// Why return the AppKit center: the overlay pipeline publishes AppKit global
+    /// coordinates to `detectedElementScreenLocation`. The element's `appKitFrame`
+    /// is already in that space (converted during the AX walk by
+    /// `ScreenCoordinateConverter.convertCGGlobalRectToAppKitGlobalRect`), so we
+    /// read it directly without any further conversion.
+    ///
+    /// Why this is static: pure function over value types — no NSScreen side
+    /// effects, callable from any thread, and directly unit-testable.
+    ///
+    /// - Parameters:
+    ///   - elementID: The integer from `[POINT:E<id>:...]`, e.g. 12 for E12.
+    ///   - inventory: The inventory captured for the current interaction. Pass nil
+    ///     when no inventory was available (AX walk timed out or not yet wired).
+    ///   - allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame },
+    ///     passed as a parameter so the function remains pure and testable without
+    ///     a display attached. Used only for the screen-assignment helper called by
+    ///     the resolution site; not needed by this function itself.
+    /// - Returns: The center of the element's AppKit frame, or nil when the element
+    ///   cannot be resolved (nil inventory, or ID not found in the element list).
+    static func resolveElementIDToAppKitCenter(
+        elementID: Int,
+        inventory: AccessibilityElementInventory?,
+        allScreenFramesInAppKitCoordinates: [CGRect]
+    ) -> CGPoint? {
+        guard let inventory else {
+            // No inventory available for this interaction — caller treats this
+            // exactly like [POINT:none]: speak the response, skip pointing.
+            return nil
+        }
+
+        guard let matchingElement = inventory.elements.first(where: { $0.elementID == elementID }) else {
+            // ID was present in Claude's response but is not in the inventory.
+            // Could happen if the inventory was capped before this element, or if
+            // Claude hallucinated an ID. Either way, never point at (0,0).
+            return nil
+        }
+
+        // The center of the AppKit-global frame is the exact point the overlay
+        // should fly to. AppKit frame origin is the bottom-left corner, so the
+        // center is (origin.x + width/2, origin.y + height/2).
+        let centerX = matchingElement.appKitFrame.origin.x + matchingElement.appKitFrame.width / 2
+        let centerY = matchingElement.appKitFrame.origin.y + matchingElement.appKitFrame.height / 2
+        return CGPoint(x: centerX, y: centerY)
+    }
+
+    /// Returns the screen frame (in AppKit global coordinates) that contains the
+    /// given point, or the frame of the nearest screen when no screen contains it.
+    ///
+    /// When to fall back to nearest: an element's frame center might lie outside
+    /// all screen frames if the screen was unplugged between the AX walk and the
+    /// render, or if the element straddles a display boundary. Rather than dropping
+    /// the point entirely, we use the nearest screen so the cursor still flies
+    /// somewhere sensible.
+    ///
+    /// Distance metric: the distance from `point` to the closest point within
+    /// each screen's frame. For a point already inside a frame that distance is
+    /// zero, so "contains" is naturally expressed by the same metric.
+    ///
+    /// Why the screens are passed as a parameter: this makes the function pure and
+    /// testable without NSScreen — the caller passes `NSScreen.screens.map { $0.frame }`.
+    ///
+    /// - Parameters:
+    ///   - point: A point in AppKit global coordinates (e.g. an element's AppKit center).
+    ///   - allScreenFramesInAppKitCoordinates: The AppKit frames of all connected
+    ///     displays (NSScreen.screens.map { $0.frame }).
+    /// - Returns: The screen frame that contains the point, or the nearest screen
+    ///   frame if no screen contains it. Returns `.zero` only if the screen list is empty
+    ///   (which cannot happen on a running macOS system with at least one display).
+    static func findScreenFrameContainingOrNearestToPoint(
+        point: CGPoint,
+        allScreenFramesInAppKitCoordinates: [CGRect]
+    ) -> CGRect {
+        guard !allScreenFramesInAppKitCoordinates.isEmpty else {
+            // Defensive: a running macOS system always has at least one screen.
+            return .zero
+        }
+
+        // Find the screen that contains the point exactly, or if none does,
+        // the screen whose nearest boundary is closest to the point.
+        var nearestScreenFrame = allScreenFramesInAppKitCoordinates[0]
+        var smallestDistanceToNearestBoundary = distanceFromPointToNearestEdgeOfRect(
+            point: point,
+            rect: allScreenFramesInAppKitCoordinates[0]
+        )
+
+        for screenFrame in allScreenFramesInAppKitCoordinates.dropFirst() {
+            let distanceToThisScreen = distanceFromPointToNearestEdgeOfRect(
+                point: point,
+                rect: screenFrame
+            )
+            if distanceToThisScreen < smallestDistanceToNearestBoundary {
+                smallestDistanceToNearestBoundary = distanceToThisScreen
+                nearestScreenFrame = screenFrame
+            }
+        }
+
+        return nearestScreenFrame
+    }
+
+    /// Computes the distance from `point` to the closest point within `rect`.
+    /// Returns 0.0 when the point is inside or on the boundary of the rect.
+    ///
+    /// This is a support function for `findScreenFrameContainingOrNearestToPoint`.
+    /// It is private because it is an implementation detail of screen assignment
+    /// and has no independent use in the rest of the file.
+    private static func distanceFromPointToNearestEdgeOfRect(
+        point: CGPoint,
+        rect: CGRect
+    ) -> CGFloat {
+        // Clamp the point into the rect: if the point is inside, the clamped
+        // point equals the original and the distance is 0.
+        let clampedX = max(rect.minX, min(point.x, rect.maxX))
+        let clampedY = max(rect.minY, min(point.y, rect.maxY))
+        let deltaX = point.x - clampedX
+        let deltaY = point.y - clampedY
+        return sqrt(deltaX * deltaX + deltaY * deltaY)
     }
 
     // MARK: - Onboarding Video

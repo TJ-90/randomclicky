@@ -69,7 +69,8 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
-| `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
+| `AccessibilityElementInventoryService.swift` | ~995 | Bounded, non-blocking AX walk that enumerates actionable elements in the frontmost window on a dedicated serial queue. Returns `AccessibilityElementInventory` with per-element CG and AppKit frames. |
+| `ScreenCoordinateConverter.swift` | ~249 | Pure static coordinate-space converters: screenshot-pixels→AppKit-global, CG-global↔AppKit-global (points and rects), AppKit-global→screenshot-pixel. Used by both the pointing pipeline and the inventory prompt formatter. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
