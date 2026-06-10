@@ -104,6 +104,22 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
+    /// Walkthrough step state machine for Phase C (guided walkthroughs).
+    ///
+    /// Exposed as a `let` (not @Published) because WalkthroughController is
+    /// itself an ObservableObject — SwiftUI views that need walkthrough state
+    /// observe walkthroughController directly (e.g. via @ObservedObject or by
+    /// reading companionManager.walkthroughController in an @EnvironmentObject
+    /// context). This is the same pattern as buddyDictationManager: the child
+    /// object publishes its own state, and the parent exposes the object itself
+    /// rather than mirroring every property.
+    ///
+    /// U8 will call walkthroughController.apply(event:) as turns complete.
+    /// U9 will read walkthroughController.phase and currentSnapshot for the
+    /// overlay chip and panel controls. This unit (U7) adds the property only —
+    /// handleShortcutTransition wiring is U8's responsibility.
+    let walkthroughController = WalkthroughController()
+
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
     private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
