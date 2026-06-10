@@ -182,4 +182,68 @@ enum ScreenCoordinateConverter {
             height: appKitGlobalRect.height
         )
     }
+
+    // MARK: - Display points → Screenshot pixels (rect)
+
+    /// Converts a rect from display-point space (AppKit global coordinates, the internal
+    /// representation of AX element frames after CG→AppKit conversion) into screenshot-pixel
+    /// space (top-left origin, matching the coordinate space of the images Claude receives).
+    ///
+    /// This is the inverse of the screenshot-pixel → display-point scaling that
+    /// `convertScreenshotPixelPointToAppKitGlobalPoint` performs. The prompt formatter in
+    /// `AccessibilityElementInventoryService` uses this so inventory element frames share
+    /// a coordinate space with the screenshot images — enabling Claude to cross-check visual
+    /// and structural signals without coordinate-space confusion.
+    ///
+    /// Why top-left origin in the output: screenshot images are top-left origin (pixel row 0
+    /// is the top of the display). We undo the AppKit bottom-left flip here by converting
+    /// the AppKit global rect back into display-local space and then flipping Y relative to
+    /// the display's own height before scaling to pixels.
+    ///
+    /// Why we subtract displayFrame.origin before the flip: the rect's AppKit coordinates
+    /// are global (multi-monitor), so we must translate to display-local first. The flip
+    /// must be relative to the display's own height, not the global primary-screen height.
+    ///
+    /// - Parameters:
+    ///   - appKitGlobalRect: A rect in AppKit global coordinates (e.g., an AX element frame
+    ///     after conversion via `convertCGGlobalRectToAppKitGlobalRect`).
+    ///   - displayFrameInAppKitCoordinates: The NSScreen.frame for the display this rect lives
+    ///     on, in AppKit coordinates. Used to translate from global to display-local before
+    ///     scaling. Must be the same display frame that was used during CG→AppKit conversion.
+    ///   - screenshotWidthInPixels: The pixel width of the screenshot image for this display.
+    ///   - screenshotHeightInPixels: The pixel height of the screenshot image for this display.
+    /// - Returns: The rect in screenshot-pixel space (top-left origin, integer-valued pixels).
+    static func convertAppKitGlobalRectToScreenshotPixelRect(
+        appKitGlobalRect: CGRect,
+        displayFrameInAppKitCoordinates: CGRect,
+        screenshotWidthInPixels: CGFloat,
+        screenshotHeightInPixels: CGFloat
+    ) -> CGRect {
+        // Step 1: Translate from AppKit global to display-local AppKit coordinates.
+        // Subtracting the display's global origin gives us coordinates relative to
+        // the bottom-left corner of this specific display.
+        let displayLocalAppKitX = appKitGlobalRect.origin.x - displayFrameInAppKitCoordinates.origin.x
+        let displayLocalAppKitY = appKitGlobalRect.origin.y - displayFrameInAppKitCoordinates.origin.y
+
+        // Step 2: Flip Y from AppKit bottom-left to top-left within the display.
+        // AppKit origin is at the bottom of the display; screenshots have origin at top.
+        // `displayLocalAppKitY` is the distance from the display bottom to the rect's
+        // BOTTOM edge (AppKit convention). Adding height gives the distance from the
+        // display bottom to the rect's TOP edge, then subtracting from displayHeight
+        // gives the distance from the display TOP to the rect's TOP edge — which is
+        // the top-left Y coordinate we need.
+        let displayHeight = displayFrameInAppKitCoordinates.height
+        let displayLocalTopLeftY = displayHeight - (displayLocalAppKitY + appKitGlobalRect.height)
+
+        // Step 3: Scale from display points to screenshot pixels.
+        let scaleX = screenshotWidthInPixels / displayFrameInAppKitCoordinates.width
+        let scaleY = screenshotHeightInPixels / displayHeight
+
+        return CGRect(
+            x: displayLocalAppKitX * scaleX,
+            y: displayLocalTopLeftY * scaleY,
+            width: appKitGlobalRect.width * scaleX,
+            height: appKitGlobalRect.height * scaleY
+        )
+    }
 }
