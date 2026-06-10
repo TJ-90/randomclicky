@@ -650,27 +650,17 @@ final class CompanionManager: ObservableObject {
                     // Claude's coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1280x831). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
+                    // ScreenCoordinateConverter handles clamping, ratio-scaling, Y-flip,
+                    // and displayFrame.origin offset in one place so this logic is not
+                    // duplicated between the main pipeline and the onboarding demo.
                     let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    let globalLocation = ScreenCoordinateConverter.convertScreenshotPixelPointToAppKitGlobalPoint(
+                        screenshotPixelPoint: pointCoordinate,
+                        screenshotWidthInPixels: CGFloat(targetScreenCapture.screenshotWidthInPixels),
+                        screenshotHeightInPixels: CGFloat(targetScreenCapture.screenshotHeightInPixels),
+                        displayWidthInPoints: CGFloat(targetScreenCapture.displayWidthInPoints),
+                        displayHeightInPoints: CGFloat(targetScreenCapture.displayHeightInPoints),
+                        displayFrameInAppKitCoordinates: displayFrame
                     )
 
                     detectedElementScreenLocation = globalLocation
@@ -996,20 +986,18 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let screenshotWidth = CGFloat(cursorScreenCapture.screenshotWidthInPixels)
-                let screenshotHeight = CGFloat(cursorScreenCapture.screenshotHeightInPixels)
-                let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
-                let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
+                // Same screenshot-pixel→AppKit conversion as the main pipeline.
+                // ScreenCoordinateConverter centralises the clamping, ratio-scaling,
+                // Y-flip, and displayFrame.origin offset so the two call sites stay
+                // bit-identical without duplicating the logic.
                 let displayFrame = cursorScreenCapture.displayFrame
-
-                let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-                let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-                let appKitY = displayHeight - displayLocalY
-                let globalLocation = CGPoint(
-                    x: displayLocalX + displayFrame.origin.x,
-                    y: appKitY + displayFrame.origin.y
+                let globalLocation = ScreenCoordinateConverter.convertScreenshotPixelPointToAppKitGlobalPoint(
+                    screenshotPixelPoint: pointCoordinate,
+                    screenshotWidthInPixels: CGFloat(cursorScreenCapture.screenshotWidthInPixels),
+                    screenshotHeightInPixels: CGFloat(cursorScreenCapture.screenshotHeightInPixels),
+                    displayWidthInPoints: CGFloat(cursorScreenCapture.displayWidthInPoints),
+                    displayHeightInPoints: CGFloat(cursorScreenCapture.displayHeightInPoints),
+                    displayFrameInAppKitCoordinates: displayFrame
                 )
 
                 // Set custom bubble text so the pointing animation uses Claude's
