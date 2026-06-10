@@ -58,7 +58,19 @@ struct CompanionPanelView: View {
             //         .padding(.horizontal, 16)
             // }
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            // Active walkthrough section — shown whenever a walkthrough is in
+            // progress (phase != .inactive). Cross-fades in/out by opacity so the
+            // panel doesn't jump; the section is always in the view tree.
+            if companionManager.walkthroughController.phase != .inactive {
+                Spacer()
+                    .frame(height: 16)
+
+                activeWalkthroughSection
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
+                && companionManager.walkthroughController.phase == .inactive {
                 Spacer()
                     .frame(height: 16)
 
@@ -545,6 +557,84 @@ struct CompanionPanelView: View {
 
 
 
+    // MARK: - Active Walkthrough Section
+
+    /// Panel section shown while a guided walkthrough is in progress.
+    /// Displays the current step progress, an "I did it" action button, and a
+    /// "Cancel walkthrough" escape button.
+    ///
+    /// Styling follows the existing section/button patterns in this file exactly:
+    /// section label uses the PERMISSIONS header style, action buttons use the
+    /// same padding/corner-radius/hover pattern as the existing Grant/Start buttons,
+    /// and the cancel uses the same tertiary text-button style as footer actions.
+    private var activeWalkthroughSection: some View {
+        let snapshot = companionManager.walkthroughController.currentSnapshot
+        let currentStepDisplayNumber = snapshot.currentStepIndex + 1
+        let totalStepCount = snapshot.totalStepCount
+        let isVerifying = companionManager.walkthroughController.phase == .verifying
+
+        return VStack(spacing: 2) {
+            // Section header — same style as PERMISSIONS label
+            Text("WALKTHROUGH IN PROGRESS")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 6)
+
+            // Step progress row
+            HStack(spacing: 6) {
+                // Step badge — matching the overlay chip badge style
+                Text(totalStepCount > 0
+                     ? "Step \(currentStepDisplayNumber) of \(totalStepCount)"
+                     : "Step \(currentStepDisplayNumber)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(DS.Colors.overlayCursorBlue)
+                    )
+                    .fixedSize()
+
+                // Current step instruction — read from declaredSteps
+                if snapshot.currentStepIndex < snapshot.declaredSteps.count {
+                    Text(snapshot.declaredSteps[snapshot.currentStepIndex].instruction)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.vertical, 4)
+
+            Spacer()
+                .frame(height: 8)
+
+            // "I did it" button — primary CTA for the walkthrough.
+            // Disabled while a verification turn is in flight (.verifying phase)
+            // to prevent double-submission.
+            WalkthroughIDidiItButton(
+                isVerifying: isVerifying,
+                onTap: {
+                    companionManager.runWalkthroughVerificationTurn()
+                }
+            )
+
+            Spacer()
+                .frame(height: 6)
+
+            // "Cancel walkthrough" — low-emphasis escape hatch. Uses the same
+            // footer button style as "Quit Clicky" to communicate low hierarchy.
+            WalkthroughCancelButton(
+                onTap: {
+                    companionManager.cancelActiveWalkthrough()
+                }
+            )
+        }
+    }
+
     // MARK: - Show Clicky Cursor Toggle
 
     private var showClickyCursorToggleRow: some View {
@@ -719,6 +809,7 @@ struct CompanionPanelView: View {
     // MARK: - Visual Helpers
 
     private var panelBackground: some View {
+
         RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(DS.Colors.background)
             .shadow(color: Color.black.opacity(0.5), radius: 20, x: 0, y: 10)
@@ -758,4 +849,95 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+// MARK: - Walkthrough Panel Buttons
+
+/// "I did it" primary action button shown in the active-walkthrough panel section.
+/// Calls companionManager.runWalkthroughVerificationTurn() on tap.
+/// Disabled (visually and functionally) while phase == .verifying so the user
+/// cannot double-submit before a verdict arrives.
+private struct WalkthroughIDidiItButton: View {
+    let isVerifying: Bool
+    let onTap: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 6) {
+                if isVerifying {
+                    // Subtle spinner while Claude is checking — communicates
+                    // that something is happening without hiding the label.
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .scaleEffect(0.6)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                Text(isVerifying ? "Checking…" : "I did it")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(isVerifying ? DS.Colors.textSecondary : DS.Colors.textOnAccent)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                    .fill(buttonFillColor)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isVerifying)
+        // Only attach pointer cursor when enabled — disabled state keeps
+        // the default arrow cursor so the user understands it's not clickable.
+        .pointerCursor(isEnabled: !isVerifying)
+        .onHover { hovering in
+            guard !isVerifying else { return }
+            isHovered = hovering
+        }
+        .animation(.easeOut(duration: DS.Animation.fast), value: isHovered)
+        .animation(.easeOut(duration: DS.Animation.fast), value: isVerifying)
+    }
+
+    private var buttonFillColor: Color {
+        if isVerifying {
+            return DS.Colors.accent.opacity(0.35)
+        } else if isHovered {
+            return DS.Colors.accentHover
+        } else {
+            return DS.Colors.accent
+        }
+    }
+}
+
+/// "Cancel walkthrough" low-emphasis button shown in the active-walkthrough panel section.
+/// Calls companionManager.cancelActiveWalkthrough() on tap.
+/// Uses the footer button style (textTertiary -> textPrimary on hover) so it
+/// communicates escape-hatch hierarchy without drawing too much attention.
+private struct WalkthroughCancelButton: View {
+    let onTap: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 11, weight: .medium))
+                Text("Cancel walkthrough")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(isHovered ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .animation(.easeOut(duration: DS.Animation.fast), value: isHovered)
+        .padding(.vertical, 2)
+    }
 }

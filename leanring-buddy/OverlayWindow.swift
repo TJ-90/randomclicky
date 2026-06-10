@@ -359,6 +359,25 @@ struct BlueCursorView: View {
                 .opacity(annotationsForThisScreen.isEmpty ? 0 : 1)
                 .animation(.easeInOut(duration: 0.3), value: annotationsForThisScreen.isEmpty)
 
+            // Walkthrough step chip — persists near the buddy cursor for the
+            // entire duration of a walkthrough (including the minutes-long
+            // awaitingUserAction phase). Always in the ZStack tree; cross-fades
+            // by opacity when walkthroughPhase transitions in/out of .inactive.
+            //
+            // Only rendered when the buddy is visible on this screen so the chip
+            // never floats on a secondary screen where the buddy isn't present.
+            //
+            // The chip's position is relative to cursorPosition (tracked here at
+            // 60fps by startTrackingCursor) so it follows the buddy seamlessly.
+            WalkthroughStepChipView(
+                walkthroughPhase: companionManager.walkthroughController.phase,
+                currentDisplayStepNumber: walkthroughChipStepNumber,
+                totalStepCount: companionManager.walkthroughController.currentSnapshot.totalStepCount,
+                currentStepInstruction: walkthroughChipInstruction,
+                buddyCursorPosition: cursorPosition,
+                isVisibleOnThisScreen: buddyIsVisibleOnThisScreen
+            )
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
@@ -434,6 +453,32 @@ struct BlueCursorView: View {
                     label: resolved.label
                 )
             }
+    }
+
+    /// The 1-based step number to display on the walkthrough chip.
+    ///
+    /// Uses currentStepIndex + 1 from the controller snapshot. During
+    /// .verifying the step hasn't advanced yet so the number stays on the
+    /// step being verified — correct UX ("Step 2 of 4 — checking…").
+    private var walkthroughChipStepNumber: Int {
+        companionManager.walkthroughController.currentSnapshot.currentStepIndex + 1
+    }
+
+    /// The instruction text to display on the walkthrough chip.
+    ///
+    /// Reads from declaredSteps using currentStepIndex so the instruction
+    /// matches the step number shown in the badge. Falls back to an empty
+    /// string when the step list is empty (walkthrough just declared but
+    /// first step not yet presented — the chip is not yet visible in that
+    /// state anyway, since phase is .presentingStep which shows opacity 1
+    /// but with an empty instruction, which is fine for the brief moment
+    /// before TTS finishes and the chip becomes meaningful).
+    private var walkthroughChipInstruction: String {
+        let snapshot = companionManager.walkthroughController.currentSnapshot
+        guard snapshot.currentStepIndex < snapshot.declaredSteps.count else {
+            return ""
+        }
+        return snapshot.declaredSteps[snapshot.currentStepIndex].instruction
     }
 
     /// Whether the buddy triangle should be visible on this screen.

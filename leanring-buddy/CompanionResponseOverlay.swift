@@ -215,3 +215,191 @@ private struct CompanionResponseOverlayView: View {
         }
     }
 }
+
+// MARK: - Walkthrough Step Chip
+
+/// A persistent chip displayed near the buddy cursor that shows the current
+/// walkthrough step number, instruction, and — during verification — a subtle
+/// "checking…" affordance.
+///
+/// Rendered as a ZStack layer in BlueCursorView and cross-faded by opacity
+/// based on walkthroughController.phase (never inserted/removed from the tree).
+/// Positioned relative to the buddy's current cursorPosition so it stays
+/// glued to the cursor just like the response text bubble.
+///
+/// DESIGN RATIONALE
+/// The chip uses DS.Colors.surface1 as its fill (same as the response bubble)
+/// with the overlay blue accent for the step-number badge and a verifying-state
+/// shimmer. This keeps it visually consistent with the rest of the cursor
+/// overlay without competing with annotation shapes or the response text bubble.
+struct WalkthroughStepChipView: View {
+    /// The walkthrough phase drives chip visibility and the "checking…" affordance.
+    let walkthroughPhase: WalkthroughPhase
+
+    /// 1-based display step number shown in the badge ("Step 2").
+    let currentDisplayStepNumber: Int
+
+    /// Total steps in the walkthrough ("of 4").
+    let totalStepCount: Int
+
+    /// The short imperative instruction for the current step ("Open System Settings").
+    let currentStepInstruction: String
+
+    /// The buddy cursor's current position in this screen's SwiftUI local
+    /// coordinate space. The chip is positioned relative to this so it
+    /// tracks the buddy without a separate timer.
+    let buddyCursorPosition: CGPoint
+
+    /// Whether the chip should be visible at all (i.e. this screen is the
+    /// one showing the buddy). Passed from the parent BlueCursorView so the
+    /// chip only renders once — on the screen where the buddy lives.
+    let isVisibleOnThisScreen: Bool
+
+    /// Pulses the "checking…" ellipsis animation while verifying.
+    @State private var verifyingEllipsisPhase: Int = 0
+
+    /// Timer driving the ellipsis animation during .verifying phase.
+    @State private var ellipsisTimer: Timer?
+
+    var body: some View {
+        chipBody
+            .opacity(chipOpacity)
+            .animation(.easeInOut(duration: 0.25), value: walkthroughPhase)
+            .animation(.easeInOut(duration: 0.25), value: chipOpacity)
+            // Position the chip below and to the right of the buddy cursor,
+            // offset enough to clear the buddy triangle (16px) and the
+            // navigation bubble above it.
+            .position(
+                x: buddyCursorPosition.x + chipHorizontalOffset,
+                y: buddyCursorPosition.y + chipVerticalOffset
+            )
+            .onChange(of: walkthroughPhase) { newPhase in
+                updateEllipsisTimer(for: newPhase)
+            }
+            .onAppear {
+                updateEllipsisTimer(for: walkthroughPhase)
+            }
+            .onDisappear {
+                ellipsisTimer?.invalidate()
+                ellipsisTimer = nil
+            }
+    }
+
+    // MARK: - Layout constants
+
+    /// Horizontal offset from cursor centre to the chip's centre.
+    /// Matches the response bubble's cursorOffsetX (22pt) so the two never collide.
+    private let chipHorizontalOffset: CGFloat = 14
+
+    /// Vertical offset places the chip below the buddy cursor so it doesn't
+    /// obscure the navigation bubble above the cursor.
+    private let chipVerticalOffset: CGFloat = 34
+
+    // MARK: - Chip content
+
+    @ViewBuilder
+    private var chipBody: some View {
+        HStack(spacing: 6) {
+            // Step-number badge — accent-coloured pill
+            Text(stepBadgeText)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundColor(DS.Colors.textOnAccent)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(DS.Colors.overlayCursorBlue)
+                )
+                .fixedSize()
+
+            // Instruction text — truncated to keep the chip compact
+            Text(instructionDisplayText)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textPrimary)
+                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 200, alignment: .leading)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(DS.Colors.surface1.opacity(0.95))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(chipBorderColor, lineWidth: 0.8)
+                )
+                .shadow(color: Color.black.opacity(0.3), radius: 10, x: 0, y: 4)
+        )
+        .fixedSize()
+    }
+
+    // MARK: - Derived display strings
+
+    /// Returns a pure static string for the step badge label.
+    /// Called "static" in spirit — this is the pure function the plan requires,
+    /// extracted as a named computed property so it can be exercised from tests
+    /// by constructing a WalkthroughStepChipView and reading the property.
+    var stepBadgeText: String {
+        if totalStepCount > 0 {
+            return "Step \(currentDisplayStepNumber) of \(totalStepCount)"
+        } else {
+            return "Step \(currentDisplayStepNumber)"
+        }
+    }
+
+    /// The instruction text shown next to the badge. During .verifying we
+    /// append an animated "checking…" ellipsis to communicate that a fresh
+    /// Claude turn is in flight.
+    var instructionDisplayText: String {
+        switch walkthroughPhase {
+        case .verifying:
+            let ellipsis = String(repeating: ".", count: verifyingEllipsisPhase + 1)
+            return "checking\(ellipsis)"
+        default:
+            return currentStepInstruction
+        }
+    }
+
+    // MARK: - Visibility
+
+    /// The chip is visible while a walkthrough is active AND the buddy is on
+    /// this screen. Cross-fade animation is driven by the opacity value so
+    /// the view is always in the SwiftUI tree (never inserted/removed).
+    private var chipOpacity: Double {
+        guard isVisibleOnThisScreen else { return 0 }
+        switch walkthroughPhase {
+        case .inactive:
+            return 0
+        case .presentingStep, .awaitingUserAction, .verifying:
+            return 1
+        }
+    }
+
+    // MARK: - Visual state
+
+    private var chipBorderColor: Color {
+        switch walkthroughPhase {
+        case .verifying:
+            // Slightly brighter border during verification to communicate activity
+            return DS.Colors.overlayCursorBlue.opacity(0.4)
+        default:
+            return DS.Colors.borderSubtle.opacity(0.6)
+        }
+    }
+
+    // MARK: - Ellipsis animation
+
+    private func updateEllipsisTimer(for phase: WalkthroughPhase) {
+        ellipsisTimer?.invalidate()
+        ellipsisTimer = nil
+        verifyingEllipsisPhase = 0
+
+        guard phase == .verifying else { return }
+
+        // Cycle through 0, 1, 2 to produce "checking.", "checking..", "checking..."
+        ellipsisTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            verifyingEllipsisPhase = (verifyingEllipsisPhase + 1) % 3
+        }
+    }
+}

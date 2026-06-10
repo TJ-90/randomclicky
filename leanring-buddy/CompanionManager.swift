@@ -129,6 +129,20 @@ final class CompanionManager: ObservableObject {
     /// previous turn cannot accidentally re-trigger step presentation.
     private var pendingWalkthroughStepAfterTTS: WalkthroughStep? = nil
 
+    /// The resolved screen annotations that belong to the currently active
+    /// walkthrough step — stored separately so they can survive a help turn
+    /// (which may replace resolvedScreenAnnotations with its own annotations).
+    ///
+    /// Set when the walkthrough controller transitions to awaitingUserAction
+    /// (i.e. when the step has been fully presented and the step's pointing +
+    /// annotations are on screen). Cleared by clearAllStepVisuals() at the end
+    /// of the walkthrough or on cancel.
+    ///
+    /// After a help turn's TTS completes, these annotations are restored into
+    /// resolvedScreenAnnotations so the step's visual anchor reappears even
+    /// though the help response may have temporarily replaced them.
+    var stepAnnotationsForActiveWalkthrough: [ResolvedScreenAnnotation] = []
+
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
     private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
@@ -342,16 +356,53 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Clears the pointing trio (buddy cursor target) and — unless a walkthrough
+    /// step is actively being shown — also clears the annotation shapes.
+    ///
+    /// During a walkthrough's .awaitingUserAction or .presentingStep phase the
+    /// annotations are the step's visual anchor and must survive the 3-second
+    /// hold-and-fly-back that normally clears them.  The buddy still flies home
+    /// (detectedElementScreenLocation is always cleared), but the annotation
+    /// shapes remain until the walkthrough ends or is cancelled.
+    ///
+    /// For all non-walkthrough code paths this function behaves exactly as
+    /// before: annotations are cleared together with the pointing trio.
     func clearDetectedElementLocation() {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
-        // Annotations share the pointing lifecycle — they fade when the buddy
-        // flies back to the cursor, when a new PTT press cancels the response,
-        // and when transient mode hides the overlay. Clearing here means a
-        // single call site covers all those scenarios: wherever pointing state
-        // clears, annotation shapes clear with it.
+
+        // Preserve annotations while a walkthrough step is live.
+        // Both .awaitingUserAction and .presentingStep represent phases where the
+        // step's visual anchor (annotation shapes) must remain on screen — the
+        // former lasts as long as the user takes to complete the step, the latter
+        // lasts until TTS finishes. Clearing annotations during either would leave
+        // the user with no visual reference for where to look.
+        let walkthroughPhase = walkthroughController.phase
+        let walkthroughStepIsLive = (walkthroughPhase == .awaitingUserAction
+                                     || walkthroughPhase == .presentingStep)
+        if walkthroughStepIsLive {
+            // The buddy flies home but annotations stay. Do NOT clear
+            // resolvedScreenAnnotations here.
+            return
+        }
+
+        // Non-walkthrough path: annotations share the pointing lifecycle as before.
         resolvedScreenAnnotations = []
+    }
+
+    /// Clears the pointing trio AND all annotation shapes unconditionally.
+    ///
+    /// Used at walkthrough end (completion / cancellation) and anywhere a
+    /// full reset is needed regardless of walkthrough phase. This is the
+    /// companion to clearDetectedElementLocation() — call this one when you
+    /// want everything gone, call the other when normal lifecycle rules apply.
+    func clearAllStepVisuals() {
+        detectedElementScreenLocation = nil
+        detectedElementDisplayFrame = nil
+        detectedElementBubbleText = nil
+        resolvedScreenAnnotations = []
+        stepAnnotationsForActiveWalkthrough = []
     }
 
     func stop() {
@@ -940,6 +991,7 @@ final class CompanionManager: ObservableObject {
 
                 if let declaration = walkthroughParseResult.declaration {
                     walkthroughController.apply(event: .walkthroughDeclared(totalStepCount: declaration.totalStepCount))
+                    ClickyAnalytics.trackWalkthroughStarted(totalSteps: declaration.totalStepCount)
                     print("📋 Walkthrough declared: \(declaration.totalStepCount) steps")
                 }
 
@@ -1137,7 +1189,31 @@ final class CompanionManager: ObservableObject {
                             stepNumber: stepToPresent.stepNumber,
                             instruction: stepToPresent.instruction
                         )))
+                        // Store the step's resolved annotations so we can restore
+                        // them after a help turn replaces resolvedScreenAnnotations
+                        // with help-response annotations. This snapshot is taken
+                        // immediately after TTS ends — the step's pointing + annotation
+                        // state is exactly what the user sees on screen right now.
+                        stepAnnotationsForActiveWalkthrough = resolvedScreenAnnotations
                         print("📋 Walkthrough step \(stepToPresent.stepNumber) presented — now awaitingUserAction")
+                    }
+                } else if walkthroughController.phase == .awaitingUserAction
+                            && !stepAnnotationsForActiveWalkthrough.isEmpty {
+                    // This was a help turn (no pendingWalkthroughStepAfterTTS) while
+                    // a walkthrough step was active. The help response's TTS just
+                    // finished — restore the step's visual anchor so the user still
+                    // sees the annotation for the step they need to complete.
+                    //
+                    // We wait for TTS to finish first so the help response's own
+                    // annotations (if any) don't disappear mid-speech; the step
+                    // annotations reappear as a natural handoff once the help is done.
+                    while elevenLabsTTSClient.isPlaying {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                        guard !Task.isCancelled else { break }
+                    }
+                    if !Task.isCancelled {
+                        resolvedScreenAnnotations = stepAnnotationsForActiveWalkthrough
+                        print("📋 Walkthrough: step annotations restored after help turn")
                     }
                 }
 
@@ -1160,7 +1236,20 @@ final class CompanionManager: ObservableObject {
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
+    ///
+    /// WALKTHROUGH SUPPRESSION: when walkthroughController.phase != .inactive
+    /// the buddy must remain visible for the entire walkthrough session — the
+    /// user needs the overlay to see step annotations and the chip even with
+    /// "Show Clicky" off.  In that case this function returns immediately
+    /// without scheduling a hide. When the walkthrough ends (completion or
+    /// cancellation), cancelActiveWalkthrough() and the verification path
+    /// each call scheduleTransientHideIfNeeded() again so normal transient
+    /// behaviour resumes at that point.
     private func scheduleTransientHideIfNeeded() {
+        // Suppress transient hide during any active walkthrough phase — the
+        // buddy must stay visible while the user is being guided step by step.
+        guard walkthroughController.phase == .inactive else { return }
+
         guard !isClickyCursorEnabled && isOverlayVisible else { return }
 
         transientHideTask?.cancel()
@@ -1392,9 +1481,21 @@ final class CompanionManager: ObservableObject {
                             print("⚠️ Verification TTS error: \(error)")
                         }
                     }
+                    // Capture the step number before the controller advances (it
+                    // increments currentStepIndex on stepVerifiedDone).
+                    let completedStepNumber = walkthroughController.currentSnapshot.currentStepIndex + 1
                     let verifyDoneEffect = walkthroughController.apply(event: .stepVerifiedDone)
                     if verifyDoneEffect == .announceCompletion {
+                        // The walkthrough reached its last step — fire completed analytics.
+                        ClickyAnalytics.trackWalkthroughCompleted(
+                            totalSteps: walkthroughController.currentSnapshot.totalStepCount
+                        )
+                        // Walkthrough is now inactive — resume normal transient behaviour.
+                        scheduleTransientHideIfNeeded()
                         print("📋 Walkthrough complete!")
+                    } else {
+                        // Mid-walkthrough step advance.
+                        ClickyAnalytics.trackWalkthroughStepAdvanced(stepNumber: completedStepNumber)
                     }
                     // If there is a next step in this response, wait for TTS to finish
                     // then apply stepPresented so the controller reaches awaitingUserAction.
@@ -1409,6 +1510,9 @@ final class CompanionManager: ObservableObject {
                                 stepNumber: stepToPresent.stepNumber,
                                 instruction: stepToPresent.instruction
                             )))
+                            // Snapshot the new step's annotations for the same
+                            // restore-after-help-turn mechanism as the main pipeline.
+                            stepAnnotationsForActiveWalkthrough = resolvedScreenAnnotations
                             print("📋 Walkthrough step \(stepToPresent.stepNumber) presented after verification")
                         }
                     }
@@ -1424,7 +1528,20 @@ final class CompanionManager: ObservableObject {
                             print("⚠️ Verification retry TTS error: \(error)")
                         }
                     }
+                    // Apply the retry and track analytics. newRetryCount is read from
+                    // the snapshot AFTER the transition — the controller increments it.
                     walkthroughController.apply(event: .stepNeedsRetry(hint: hint))
+                    let retryStepNumber = walkthroughController.currentSnapshot.currentStepIndex + 1
+                    let retryCount = walkthroughController.currentSnapshot.retryCountForCurrentStep
+                    ClickyAnalytics.trackWalkthroughStepRetried(
+                        stepNumber: retryStepNumber,
+                        retryCount: retryCount
+                    )
+                    // Restore the step's visual anchor so the user still sees the
+                    // annotation for the step they need to redo.
+                    if !stepAnnotationsForActiveWalkthrough.isEmpty {
+                        resolvedScreenAnnotations = stepAnnotationsForActiveWalkthrough
+                    }
                     print("📋 Walkthrough step retry: \(hint)")
 
                 case nil:
@@ -1471,6 +1588,9 @@ final class CompanionManager: ObservableObject {
     func cancelActiveWalkthrough() {
         guard walkthroughController.phase != .inactive else { return }
 
+        // Track the step we're on before the controller resets to inactive.
+        let cancelledAtStepNumber = walkthroughController.currentSnapshot.currentStepIndex + 1
+
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
         pendingWalkthroughStepAfterTTS = nil
@@ -1483,8 +1603,17 @@ final class CompanionManager: ObservableObject {
             synthesizer.startSpeaking("ok, walkthrough cancelled")
         }
 
-        clearDetectedElementLocation()
-        print("📋 Walkthrough cancelled by user")
+        // Use the full-clear variant so both pointing state AND step annotations
+        // are wiped — clearDetectedElementLocation() would preserve annotations
+        // because the phase was still active at call time.
+        clearAllStepVisuals()
+
+        ClickyAnalytics.trackWalkthroughCancelled(atStep: cancelledAtStepNumber)
+        print("📋 Walkthrough cancelled by user at step \(cancelledAtStepNumber)")
+
+        // Walkthrough is now inactive — resume normal transient-cursor behaviour
+        // in case the user had "Show Clicky" off.
+        scheduleTransientHideIfNeeded()
     }
 
     // MARK: - Point Tag Parsing

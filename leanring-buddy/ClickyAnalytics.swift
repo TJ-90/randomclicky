@@ -163,6 +163,44 @@ enum ClickyAnalytics {
         ])
     }
 
+    // MARK: - Guided Walkthroughs
+
+    /// A new guided walkthrough was declared by Claude (WALKTHROUGH tag parsed).
+    static func trackWalkthroughStarted(totalSteps: Int) {
+        PostHogSDK.shared.capture("walkthrough_started", properties: [
+            "total_steps": totalSteps
+        ])
+    }
+
+    /// The controller advanced to the next step after a successful verification.
+    static func trackWalkthroughStepAdvanced(stepNumber: Int) {
+        PostHogSDK.shared.capture("walkthrough_step_advanced", properties: [
+            "step_number": stepNumber
+        ])
+    }
+
+    /// The verification turn returned VERIFY:retry — the user needs to redo a step.
+    static func trackWalkthroughStepRetried(stepNumber: Int, retryCount: Int) {
+        PostHogSDK.shared.capture("walkthrough_step_retried", properties: [
+            "step_number": stepNumber,
+            "retry_count": retryCount
+        ])
+    }
+
+    /// The walkthrough reached its final step and was verified done.
+    static func trackWalkthroughCompleted(totalSteps: Int) {
+        PostHogSDK.shared.capture("walkthrough_completed", properties: [
+            "total_steps": totalSteps
+        ])
+    }
+
+    /// The user cancelled the walkthrough before it completed.
+    static func trackWalkthroughCancelled(atStep: Int) {
+        PostHogSDK.shared.capture("walkthrough_cancelled", properties: [
+            "at_step": atStep
+        ])
+    }
+
     // MARK: - Errors
 
     /// An error occurred during the AI response pipeline.
