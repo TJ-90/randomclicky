@@ -208,9 +208,16 @@ class ClaudeAPI {
         )
         messages.append(["role": "user", "content": contentBlocks])
 
+        // 2048 tokens rather than 1024: multi-annotation responses and walkthrough
+        // declarations (Phase B/C) can easily exceed 1024 tokens when Claude emits
+        // several inline [BOX/CIRCLE/ARROW/HIGHLIGHT:...] tags plus a full explanation,
+        // or when a [WALKTHROUGH:n] declaration lists multiple step instructions.
+        // 2048 gives comfortable headroom while keeping per-request cost bounded.
+        // The non-streaming analyzeImage path stays at 256 — it is only used for
+        // lightweight validation requests (onboarding demo), not the main pipeline.
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "stream": true,
             "system": systemPrompt,
             "messages": messages

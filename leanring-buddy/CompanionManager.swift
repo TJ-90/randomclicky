@@ -52,6 +52,22 @@ final class CompanionManager: ObservableObject {
     /// without needing a separate accessor.
     var inventoryForCurrentInteraction: AccessibilityElementInventory? = nil
 
+    /// Annotation tags (BOX/CIRCLE/ARROW/HIGHLIGHT) parsed from the most recent
+    /// Claude response for the current interaction.
+    ///
+    /// Populated in `sendTranscriptToClaudeWithScreenshot` immediately after
+    /// `AnnotationTagParser.parseAnnotationTags(from:)` runs — BEFORE the
+    /// end-anchored POINT parser so the POINT parser sees a clean tail.
+    ///
+    /// U6 reads this to render the annotation shapes in the overlay.
+    /// U6 will promote this to a `@Published` property so SwiftUI views can
+    /// observe it; it is intentionally un-published here (U5 scope) to keep
+    /// the diff minimal and document the promotion point clearly.
+    ///
+    /// Reset to empty on every new interaction (when this method is entered),
+    /// matching the lifecycle of `inventoryForCurrentInteraction`.
+    var annotationsParsedFromCurrentResponse: [ParsedScreenAnnotation] = []
+
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
     @Published var onboardingVideoPlayer: AVPlayer?
@@ -593,6 +609,27 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode (no inventory): "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+
+    screen annotations:
+    when the user would benefit from seeing multiple regions highlighted at once — like a form with several fields to fill in, a comparison between two UI areas, or a set of related controls — you can draw annotation shapes directly on the screen. use these alongside or instead of a single POINT when there are multiple things to show.
+
+    annotation tags go INLINE in your response, right where they're relevant — not at the end like POINT. they're stripped before being spoken, so never describe them out loud and never end a sentence with one.
+
+    four shapes: BOX draws a rectangle, CIRCLE draws an oval, ARROW points at something, HIGHLIGHT fills a region with a translucent wash.
+
+    tag format: [SHAPE:target:label] where SHAPE is BOX, CIRCLE, ARROW, or HIGHLIGHT. the label is optional. use the same target forms as POINT:
+    - element-ID form (preferred when inventory is present): [BOX:E12:first name field]
+    - pixel-rect form (fallback): [BOX:x,y,w,h:label] or [BOX:x,y,w,h:label:screenN] — x,y is the top-left corner, w,h is the size, all in screenshot pixel space (same coordinate space as POINT pixel coordinates).
+
+    pick element IDs from the current inventory when available — they resolve to exact frames and are more accurate than pixel estimates. pixel-rect fallback is for elements not in the inventory (games, video, web content where the AX tree is sparse).
+
+    examples:
+    - user asks how to fill out a form: "fill in your name [BOX:E3:name field] then your email [BOX:E4:email field] and hit [ARROW:E7:submit]. [POINT:E3:name field]"
+    - user asks what two buttons do: "the left one [HIGHLIGHT:E5:cancel] discards everything, the right one [HIGHLIGHT:E6:save] keeps your changes. [POINT:E5:cancel]"
+    - user asks about a login screen (no inventory): "enter your email in the top box [BOX:120,200,400,48:email field] and your password below [BOX:120,264,400,48:password field]. [POINT:120,200:email field]"
+    - user asks a general knowledge question: "the capital of france is paris. [POINT:none]"
+
+    you can still include a single POINT at the end to make the cursor fly to the most important element. annotations and POINT work together fine.
     """
 
     // MARK: - AI Response Pipeline
@@ -728,8 +765,36 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
+                // --- Annotation parsing (Phase B, U5) ---
+                // Run the scanning annotation parser FIRST, before the end-anchored
+                // POINT parser. Annotation tags appear anywhere in the response body;
+                // stripping them here ensures the POINT parser sees a clean tail so
+                // its end-anchor regex still finds [POINT:...] at the true end of text.
+                //
+                // Parse order contract (documented in AnnotationTagParser.swift):
+                //   1. parseAnnotationTags   — strips BOX/CIRCLE/ARROW/HIGHLIGHT tags
+                //   2. parsePointingCoordinates — sees annotation-free text, POINT intact
+                //
+                // U6 will read `annotationsParsedFromCurrentResponse` to render shapes.
+                // We reset it here at the start of each response so stale annotations
+                // from a prior turn are never shown alongside a new response.
+                annotationsParsedFromCurrentResponse = []
+                let annotationParseResult = AnnotationTagParser.parseAnnotationTags(from: fullResponseText)
+                annotationsParsedFromCurrentResponse = annotationParseResult.annotations
+
+                // The text with annotation tags stripped is what flows downstream:
+                // into the POINT parser, TTS, and conversation history. This is the
+                // same pattern as POINT stripping — tags are never spoken or stored.
+                let responseTextAfterAnnotationStripping = annotationParseResult.strippedText
+
+                if !annotationParseResult.annotations.isEmpty {
+                    print("🖼️ Annotations parsed: \(annotationParseResult.annotations.count) shapes")
+                }
+
+                // Parse the [POINT:...] tag from the annotation-stripped response.
+                // Because annotation tags have already been removed, the end-anchor
+                // regex reliably finds [POINT:...] at the actual end of the text.
+                let parseResult = Self.parsePointingCoordinates(from: responseTextAfterAnnotationStripping)
                 let spokenText = parseResult.spokenText
 
                 // Resolve the pointing instruction to an on-screen location.
