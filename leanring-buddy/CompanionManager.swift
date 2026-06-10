@@ -59,14 +59,24 @@ final class CompanionManager: ObservableObject {
     /// `AnnotationTagParser.parseAnnotationTags(from:)` runs — BEFORE the
     /// end-anchored POINT parser so the POINT parser sees a clean tail.
     ///
-    /// U6 reads this to render the annotation shapes in the overlay.
-    /// U6 will promote this to a `@Published` property so SwiftUI views can
-    /// observe it; it is intentionally un-published here (U5 scope) to keep
-    /// the diff minimal and document the promotion point clearly.
-    ///
     /// Reset to empty on every new interaction (when this method is entered),
     /// matching the lifecycle of `inventoryForCurrentInteraction`.
     var annotationsParsedFromCurrentResponse: [ParsedScreenAnnotation] = []
+
+    /// Annotations from the current response that have been fully resolved to
+    /// on-screen AppKit rectangles and are ready for the overlay to render.
+    ///
+    /// Each entry carries the AppKit-global rect, the display frame of its
+    /// target screen (so each per-screen BlueCursorView can filter to its own
+    /// screen), the annotation kind, and an optional label.
+    ///
+    /// Published so BlueCursorView observes it and reacts to changes exactly
+    /// like `detectedElementScreenLocation` — the same state-publication
+    /// handshake. Set alongside the pointing publication in
+    /// `sendTranscriptToClaudeWithScreenshot`; cleared inside
+    /// `clearDetectedElementLocation()` so both halves of the overlay state
+    /// (pointing cursor + annotation shapes) are always cleared together.
+    @Published private(set) var resolvedScreenAnnotations: [ResolvedScreenAnnotation] = []
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -311,6 +321,12 @@ final class CompanionManager: ObservableObject {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+        // Annotations share the pointing lifecycle — they fade when the buddy
+        // flies back to the cursor, when a new PTT press cancels the response,
+        // and when transient mode hides the overlay. Clearing here means a
+        // single call site covers all those scenarios: wherever pointing state
+        // clears, annotation shapes clear with it.
+        resolvedScreenAnnotations = []
     }
 
     func stop() {
@@ -791,6 +807,33 @@ final class CompanionManager: ObservableObject {
                     print("🖼️ Annotations parsed: \(annotationParseResult.annotations.count) shapes")
                 }
 
+                // --- Annotation resolution (Phase B, U6) ---
+                // Resolve the parsed annotations to exact AppKit-global rects and
+                // publish them so each per-screen BlueCursorView can render its slice.
+                // Resolution uses the inventory captured for THIS interaction (element-ID
+                // form) or ScreenCoordinateConverter (pixel-rect form), mirroring the
+                // two pointing-resolution branches exactly.
+                //
+                // Published BEFORE the POINT resolution block below so the annotations
+                // are already set when voiceState switches to .idle (which triggers the
+                // flight animation in BlueCursorView and the opacity cross-fade for
+                // annotation shapes).
+                //
+                // resolvedScreenAnnotations is reset to [] at the top of this method
+                // via clearDetectedElementLocation() (called by handleShortcutTransition
+                // on every new PTT press), and again in clearDetectedElementLocation()
+                // when the buddy finishes its return flight — so the lifecycle exactly
+                // mirrors the pointing-cursor lifecycle.
+                resolvedScreenAnnotations = Self.resolveAnnotationsToScreenRects(
+                    parsedAnnotations: annotationParseResult.annotations,
+                    inventory: inventoryForCurrentInteraction,
+                    screenCaptures: screenCaptures,
+                    allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
+                )
+                if !resolvedScreenAnnotations.isEmpty {
+                    print("🖼️ Annotations resolved: \(resolvedScreenAnnotations.count) shapes ready for overlay")
+                }
+
                 // Parse the [POINT:...] tag from the annotation-stripped response.
                 // Because annotation tags have already been removed, the end-anchor
                 // regex reliably finds [POINT:...] at the actual end of the text.
@@ -1178,6 +1221,172 @@ final class CompanionManager: ObservableObject {
         let headerLine = "Interactive elements of the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space:"
 
         return "\(headerLine)\n\(formattedElementLines)"
+    }
+
+    // MARK: - ResolvedScreenAnnotation
+
+    /// An annotation from Claude's response that has been resolved to an exact
+    /// AppKit-global rect and is ready for a per-screen overlay view to render.
+    ///
+    /// The separation between `ParsedScreenAnnotation` (U5, raw parse output) and
+    /// this type (U6, resolved output) keeps the parser pure: it never touches
+    /// NSScreen or the inventory. Resolution happens here in CompanionManager
+    /// where both the inventory and the screen list are available.
+    struct ResolvedScreenAnnotation {
+        /// The visual shape to draw.
+        let kind: ScreenAnnotationKind
+        /// The bounding rect of the target element or region, expressed in AppKit
+        /// global coordinates (bottom-left origin of the primary display, points).
+        /// Each per-screen BlueCursorView converts this to its own SwiftUI-local
+        /// coordinate space using `convertAppKitGlobalRectToSwiftUILocalRect`.
+        let rectInAppKitGlobalCoordinates: CGRect
+        /// The display frame (AppKit global, NSScreen.frame) of the screen this
+        /// annotation belongs to. Each BlueCursorView compares its own `screenFrame`
+        /// against this value to decide whether to render this annotation.
+        let displayFrameOfTargetScreen: CGRect
+        /// Optional short label shown as a chip near the annotation shape.
+        let label: String?
+    }
+
+    /// Resolves a list of parsed annotations to their exact AppKit-global rects
+    /// and screen assignments. This is a pure static function so it can be
+    /// directly unit-tested without constructing a CompanionManager.
+    ///
+    /// Resolution rules:
+    ///   - `.elementID` targets: look up the element in the inventory → use its
+    ///     `appKitFrame`. If the inventory is nil or the ID is not found, the
+    ///     annotation is dropped (never a zero-rect artifact).
+    ///   - `.pixelRect` targets: convert the screenshot-pixel rect to AppKit
+    ///     global using ScreenCoordinateConverter. The screen capture is selected
+    ///     the same way as for pixel-form POINT: if a screenNumber is specified
+    ///     and valid, use that capture; otherwise fall back to the cursor screen.
+    ///     If no matching capture is found, the annotation is dropped.
+    ///
+    /// Screen assignment: each resolved annotation's `displayFrameOfTargetScreen`
+    /// is the `displayFrame` of the screen capture (for pixel-rect targets) or the
+    /// screen frame nearest to the element's AppKit-center (for element-ID targets).
+    /// This mirrors the identical assignment logic used for POINT resolution.
+    ///
+    /// - Parameters:
+    ///   - parsedAnnotations: The raw annotations from `AnnotationTagParser`.
+    ///   - inventory: The AX inventory for the current interaction, or nil when
+    ///     none was available (AX walk timed out, AX-less app, etc.).
+    ///   - screenCaptures: All screen captures for this interaction, in the same
+    ///     order as they were passed to Claude (1-based screen numbers).
+    ///   - allScreenFramesInAppKitCoordinates: `NSScreen.screens.map { $0.frame }`,
+    ///     passed as a parameter so the function stays pure and testable.
+    /// - Returns: The resolved annotations, in the same order as the input list
+    ///   (annotations that could not be resolved are simply absent from the output).
+    static func resolveAnnotationsToScreenRects(
+        parsedAnnotations: [ParsedScreenAnnotation],
+        inventory: AccessibilityElementInventory?,
+        screenCaptures: [CompanionScreenCapture],
+        allScreenFramesInAppKitCoordinates: [CGRect]
+    ) -> [ResolvedScreenAnnotation] {
+
+        var resolvedAnnotations: [ResolvedScreenAnnotation] = []
+
+        for parsedAnnotation in parsedAnnotations {
+            switch parsedAnnotation.target {
+
+            case .elementID(let elementID):
+                // Element-ID resolution: look up the element's AppKit frame from
+                // the inventory captured for this interaction. Unknown IDs are
+                // dropped — never produce a (0,0) annotation.
+                guard let inventory else {
+                    // No inventory available for this turn — drop this annotation.
+                    continue
+                }
+                guard let matchingElement = inventory.elements.first(where: { $0.elementID == elementID }) else {
+                    // ID referenced by Claude but not present in the inventory —
+                    // capped, hallucinated, or stale. Drop rather than misplace.
+                    continue
+                }
+
+                // The element's appKitFrame is already in AppKit global coordinates;
+                // no further conversion needed.
+                let elementAppKitRect = matchingElement.appKitFrame
+                let elementCenter = CGPoint(
+                    x: elementAppKitRect.midX,
+                    y: elementAppKitRect.midY
+                )
+                let targetScreenFrame = findScreenFrameContainingOrNearestToPoint(
+                    point: elementCenter,
+                    allScreenFramesInAppKitCoordinates: allScreenFramesInAppKitCoordinates
+                )
+
+                resolvedAnnotations.append(ResolvedScreenAnnotation(
+                    kind: parsedAnnotation.kind,
+                    rectInAppKitGlobalCoordinates: elementAppKitRect,
+                    displayFrameOfTargetScreen: targetScreenFrame,
+                    label: parsedAnnotation.label
+                ))
+
+            case .pixelRect(let screenshotPixelRect, let screenNumber):
+                // Pixel-rect resolution: same screen-selection logic as POINT pixel form.
+                // screenNumber is 1-based; nil means the cursor screen.
+                let targetScreenCapture: CompanionScreenCapture? = {
+                    if let screenNumber,
+                       screenNumber >= 1,
+                       screenNumber <= screenCaptures.count {
+                        return screenCaptures[screenNumber - 1]
+                    }
+                    return screenCaptures.first(where: { $0.isCursorScreen })
+                }()
+
+                guard let captureForThisAnnotation = targetScreenCapture else {
+                    // No matching screen capture — drop the annotation.
+                    continue
+                }
+
+                // Convert the rect origin (top-left in screenshot-pixel space)
+                // to AppKit global using the same converter as point conversion.
+                // We convert the origin and the opposite corner separately so we
+                // can use the existing point converter, then reconstruct the rect.
+                let displayFrame = captureForThisAnnotation.displayFrame
+                let screenshotWidth = CGFloat(captureForThisAnnotation.screenshotWidthInPixels)
+                let screenshotHeight = CGFloat(captureForThisAnnotation.screenshotHeightInPixels)
+                let displayWidth = CGFloat(captureForThisAnnotation.displayWidthInPoints)
+                let displayHeight = CGFloat(captureForThisAnnotation.displayHeightInPoints)
+
+                // Scale the rect from screenshot-pixel space to AppKit global.
+                // We scale origin + size directly (no Y flip on size), then apply
+                // the full point conversion to the rect using the dedicated rect
+                // helper which handles the bottom-left origin adjustment correctly.
+                let scaleX = displayWidth / screenshotWidth
+                let scaleY = displayHeight / screenshotHeight
+
+                // Scale to display-point space (still top-left origin, display-local)
+                let displayLocalX = screenshotPixelRect.origin.x * scaleX
+                let displayLocalY = screenshotPixelRect.origin.y * scaleY
+                let displayLocalWidth = screenshotPixelRect.width * scaleX
+                let displayLocalHeight = screenshotPixelRect.height * scaleY
+
+                // Flip Y from top-left (display-local) to bottom-left (AppKit display-local):
+                // AppKit rect origin is at the bottom-left edge of the rect, so
+                // appKitLocalY = displayHeight - (displayLocalY + height).
+                let appKitLocalY = displayHeight - (displayLocalY + displayLocalHeight)
+
+                // Translate from display-local to AppKit global by adding the
+                // display's origin offset. For the primary display this is (0,0);
+                // for secondary displays it reflects the user's Displays arrangement.
+                let appKitGlobalRect = CGRect(
+                    x: displayLocalX + displayFrame.origin.x,
+                    y: appKitLocalY + displayFrame.origin.y,
+                    width: displayLocalWidth,
+                    height: displayLocalHeight
+                )
+
+                resolvedAnnotations.append(ResolvedScreenAnnotation(
+                    kind: parsedAnnotation.kind,
+                    rectInAppKitGlobalCoordinates: appKitGlobalRect,
+                    displayFrameOfTargetScreen: displayFrame,
+                    label: parsedAnnotation.label
+                ))
+            }
+        }
+
+        return resolvedAnnotations
     }
 
     // MARK: - Element-ID Resolution Helpers

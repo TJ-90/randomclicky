@@ -336,6 +336,29 @@ struct BlueCursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
+            // Annotation layer — renders BOX/CIRCLE/ARROW/HIGHLIGHT shapes for
+            // annotations that belong to THIS screen (filtered by displayFrameOfTargetScreen).
+            //
+            // Cross-fade by opacity, following the file's documented discipline:
+            // views are NEVER inserted or removed (which would cause a pop). Instead
+            // the layer is always present and fades in/out based on whether this
+            // screen has annotations.
+            //
+            // The layer is positioned at the ZStack's default (0,0) rather than
+            // at cursorPosition because annotations are screen-level overlays
+            // anchored to element rects, not to the cursor's current position.
+            //
+            // ignoresMouseEvents is handled at the window level (OverlayWindow.init
+            // sets self.ignoresMouseEvents = true), so no additional hit-testing
+            // override is needed here.
+            //
+            // Animation: we use .easeInOut(duration: 0.3) for the layer opacity
+            // cross-fade, slightly slower than the cursor's .easeIn(0.15) since
+            // annotations represent stable regions rather than a quick state flash.
+            AnnotationLayerView(annotationsForThisScreen: annotationsForThisScreen)
+                .opacity(annotationsForThisScreen.isEmpty ? 0 : 1)
+                .animation(.easeInOut(duration: 0.3), value: annotationsForThisScreen.isEmpty)
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
@@ -384,6 +407,33 @@ struct BlueCursorView: View {
 
             startNavigatingToElement(screenLocation: screenLocation)
         }
+    }
+
+    /// The annotations from the current response that belong to THIS screen,
+    /// converted from AppKit-global rects to SwiftUI-local rects so the
+    /// AnnotationLayerView receives ready-to-render data.
+    ///
+    /// Filtering rule: an annotation belongs to this screen when its
+    /// `displayFrameOfTargetScreen` exactly equals `screenFrame`. This is
+    /// the same guard pattern used for pointing (`displayFrame == screenFrame`
+    /// in the onChange handler below) — annotations live on the same screen
+    /// as the element or pixel rect they reference.
+    ///
+    /// Rects that map outside this screen's bounds after conversion are passed
+    /// through anyway — AnnotationLayerView positions them via SwiftUI coordinates
+    /// and SwiftUI will naturally clip anything outside the screen frame.
+    private var annotationsForThisScreen: [AnnotationLayerView.AnnotationForRendering] {
+        companionManager.resolvedScreenAnnotations
+            .filter { $0.displayFrameOfTargetScreen == screenFrame }
+            .map { resolved in
+                AnnotationLayerView.AnnotationForRendering(
+                    kind: resolved.kind,
+                    localRect: convertAppKitGlobalRectToSwiftUILocalRect(
+                        resolved.rectInAppKitGlobalCoordinates
+                    ),
+                    label: resolved.label
+                )
+            }
     }
 
     /// Whether the buddy triangle should be visible on this screen.
@@ -448,6 +498,43 @@ struct BlueCursorView: View {
         let x = screenPoint.x - screenFrame.origin.x
         let y = (screenFrame.origin.y + screenFrame.height) - screenPoint.y
         return CGPoint(x: x, y: y)
+    }
+
+    /// Converts an AppKit-global rect (bottom-left origin, points) to a rect in
+    /// SwiftUI-local coordinates (top-left origin) relative to this screen's
+    /// overlay window frame.
+    ///
+    /// Why this mirrors the point converter but for rects: AppKit rects have their
+    /// origin at the BOTTOM-LEFT corner of the rect, while SwiftUI rects have their
+    /// origin at the TOP-LEFT corner. The Y conversion therefore uses the TOP edge
+    /// of the AppKit rect (origin.y + height) as the reference, not just origin.y.
+    /// This is the rect counterpart of `convertScreenPointToSwiftUICoordinates`.
+    ///
+    /// Used by the annotation layer integration below to convert resolved AppKit-
+    /// global rects into SwiftUI-local rects before passing them to
+    /// `AnnotationLayerView`, keeping all coordinate math here in BlueCursorView
+    /// rather than inside the presentation-only AnnotationLayerView.
+    ///
+    /// This is a pure helper — no side effects, no state mutations. Extracted as
+    /// a named function (not an inline expression) so it can be unit-tested and
+    /// so the annotation integration code reads clearly.
+    private func convertAppKitGlobalRectToSwiftUILocalRect(_ appKitGlobalRect: CGRect) -> CGRect {
+        // X: same as the point converter — subtract the screen's origin offset.
+        let swiftUILocalX = appKitGlobalRect.origin.x - screenFrame.origin.x
+
+        // Y: flip the rect's TOP edge (appKitOrigin.y + height) from AppKit global
+        // to SwiftUI local. In AppKit, origin.y is the bottom edge; in SwiftUI,
+        // the origin is the top edge — so we convert the top edge (which is
+        // origin.y + height in AppKit) rather than the bottom edge.
+        let appKitTopEdgeY = appKitGlobalRect.origin.y + appKitGlobalRect.height
+        let swiftUILocalY = (screenFrame.origin.y + screenFrame.height) - appKitTopEdgeY
+
+        return CGRect(
+            x: swiftUILocalX,
+            y: swiftUILocalY,
+            width: appKitGlobalRect.width,
+            height: appKitGlobalRect.height
+        )
     }
 
     // MARK: - Element Navigation

@@ -143,6 +143,12 @@ enum DS {
         /// (screen overlay vs in-app UI).
         static let overlayCursorBlue = Color(hex: "#3380FF")
 
+        /// Translucent fill for HIGHLIGHT annotations drawn in the overlay.
+        /// Uses the same overlay blue at 20% opacity so the highlighted region
+        /// is clearly tinted but does not obscure the content underneath.
+        /// Kept in the overlay group so all overlay colors are colocated.
+        static let overlayAnnotationHighlightFill = overlayCursorBlue.opacity(0.20)
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —
