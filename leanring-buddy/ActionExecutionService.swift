@@ -49,7 +49,9 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
+import os
 
 // MARK: - Result type
 
@@ -249,13 +251,28 @@ final class ActionExecutionService {
 
     // MARK: - Private state
 
-    /// Abort flag. Set by `abortCurrentAction()` and checked between every
-    /// chain stage and every keyboard chunk. Using a simple Bool protected by
-    /// the MainActor (since `execute` is async and runs on MainActor between
-    /// queue hops).
-    private var isAbortFlagSet = false
+    /// Thread-safe abort flag. Wraps a `Bool` inside an `OSAllocatedUnfairLock`
+    /// (available on macOS 13+; this app targets 14.2). This is necessary because
+    /// `abortCurrentAction()` is called on the MainActor while the typing loop
+    /// checks the flag from AX-serial-queue closures dispatched via
+    /// `performOnAXSerialQueue`. A plain Bool has no cross-thread visibility
+    /// guarantee in Swift's memory model — even with @MainActor isolation on the
+    /// write side, reads on a different OS thread can observe a stale value.
+    ///
+    /// Usage: read with `abortFlag.withLock { $0 }`, set with
+    /// `abortFlag.withLock { $0 = true }`.
+    private let abortFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    /// Convenience accessor — returns `true` if the abort flag has been set.
+    /// Safe to call from any thread.
+    private var isAbortFlagSet: Bool {
+        abortFlag.withLock { $0 }
+    }
 
     /// True while an action is executing. Prevents concurrent calls.
+    /// Set to `true` at the start of `execute(_:)` and back to `false` on
+    /// every exit path (via `defer`). Readable by `CompanionManager+PendingAction`
+    /// to detect an in-flight action for the kill-switch handler.
     private(set) var isActionCurrentlyRunning = false
 
     private init() {}
@@ -277,7 +294,7 @@ final class ActionExecutionService {
         }
 
         isActionCurrentlyRunning = true
-        isAbortFlagSet = false
+        abortFlag.withLock { $0 = false }
 
         defer {
             isActionCurrentlyRunning = false
@@ -346,13 +363,14 @@ final class ActionExecutionService {
     }
 
     /// Sets the abort flag. Checked between every chain stage and every
-    /// keyboard chunk. Thread-safe because this service is `@MainActor` and
-    /// the execute loop returns to MainActor between every AX queue hop.
+    /// keyboard chunk. Thread-safe — writes through `OSAllocatedUnfairLock`
+    /// so the update is immediately visible to the AX serial queue and any
+    /// other thread that reads `isAbortFlagSet`.
     ///
     /// Called by U11's kill-switch handler when the user presses Esc or PTT
     /// while an action is in flight.
     func abortCurrentAction() {
-        isAbortFlagSet = true
+        abortFlag.withLock { $0 = true }
     }
 
     // MARK: - Pure static: hard refusal evaluation
@@ -385,17 +403,24 @@ final class ActionExecutionService {
             )
         }
 
-        // Rule 2: System-wide secure input mode.
+        // Rule 2: System-wide secure input mode — TYPE actions only.
         // IsSecureEventInputEnabled() returns true when any app (including
         // Terminal's Secure Keyboard Entry, or a system password dialog) has
         // enabled secure keyboard input. In secure input mode, synthetic keyboard
         // events are suppressed by the OS — CGEvent typing would silently fail.
-        // More importantly, if it's not suppressed, it would mean Clicky is typing
-        // into a secure context, which we explicitly refuse.
-        if IsSecureEventInputEnabled() {
-            return .refused(
-                reason: "Secure keyboard input is active on this system. Clicky will not type while secure input is enabled."
-            )
+        // More importantly, if not suppressed, Clicky would be typing into a
+        // secure context, which we explicitly refuse.
+        //
+        // This rule applies to TYPE actions only. CGEvent mouse clicks are NOT
+        // blocked by secure keyboard input — refusing a CLICK when secure input
+        // is active is overly conservative and produces a misleading spoken reason
+        // ("will not type") for a non-typing action.
+        if case .type = action {
+            if IsSecureEventInputEnabled() {
+                return .refused(
+                    reason: "Secure keyboard input is active on this system. Clicky will not type while secure input is enabled."
+                )
+            }
         }
 
         // Rule 3: Control characters in TYPE payloads.
@@ -412,17 +437,25 @@ final class ActionExecutionService {
             }
         }
 
-        // Rule 4: Denylisted security-UI process.
-        // Resolve the owning process's executable name from its PID and compare
-        // against the hard-coded denylist.
-        if let processExecutableName = ActionExecutionService.resolveExecutableName(
+        // Rule 4: Denylisted security-UI process — fail closed.
+        // Resolve the owning process's executable name from its PID via
+        // proc_pidpath (primary) + NSWorkspace (supplement). If the name
+        // matches the denylist, refuse. If the process CANNOT be identified
+        // at all (nil), also refuse — an unresolvable PID is more suspicious
+        // than a known-safe process name, and failing open here would silently
+        // bypass the denylist for any process that evades enumeration.
+        guard let processExecutableName = ActionExecutionService.resolveExecutableName(
             forProcessID: targetElement.owningProcessID
-        ) {
-            if ActionExecutionService.deniedProcessExecutableNames.contains(processExecutableName) {
-                return .refused(
-                    reason: "Clicky does not act on '\(processExecutableName)' — this is a security UI process."
-                )
-            }
+        ) else {
+            return .refused(
+                reason: "Clicky could not identify the owning process (PID \(targetElement.owningProcessID)). Refusing to act for safety."
+            )
+        }
+
+        if ActionExecutionService.deniedProcessExecutableNames.contains(processExecutableName) {
+            return .refused(
+                reason: "Clicky does not act on '\(processExecutableName)' — this is a security UI process."
+            )
         }
 
         return nil // No refusal — execution may proceed.
@@ -430,36 +463,81 @@ final class ActionExecutionService {
 
     // MARK: - Pure static: control character check
 
-    /// Returns `true` if `text` contains any character in the C0/C1 control
-    /// range or the DEL character (U+007F).
+    /// Returns `true` if `text` contains any character that must be blocked
+    /// from TYPE payloads because it could act as a form-submit trigger or
+    /// otherwise break the "type exactly what the user confirmed" invariant.
     ///
     /// Specifically rejects:
-    ///   U+0000–U+001F (C0 controls: NULL, TAB, LF, CR, ESC, etc.)
-    ///   U+007F         (DEL)
+    ///   U+0000–U+001F  C0 controls (NULL, TAB U+0009, LF U+000A, CR U+000D,
+    ///                  ESC U+001B, etc.)
+    ///   U+007F         DEL
+    ///   U+0080–U+009F  C1 controls (including NEL U+0085 — a newline-equivalent
+    ///                  that some text targets treat as a line break / submit)
+    ///   U+2028         Unicode LINE SEPARATOR — acts as a line break in many
+    ///                  text rendering engines and some web inputs interpret it
+    ///                  as a submit trigger (same risk class as LF/CR)
+    ///   U+2029         Unicode PARAGRAPH SEPARATOR — same risk class as U+2028
     ///
     /// PURE STATIC for unit testability.
     static func textContainsControlCharacters(_ text: String) -> Bool {
         return text.unicodeScalars.contains { scalar in
-            scalar.value <= 0x001F || scalar.value == 0x007F
+            scalar.value <= 0x001F
+                || scalar.value == 0x007F
+                || (0x0080...0x009F).contains(scalar.value)
+                || scalar.value == 0x2028
+                || scalar.value == 0x2029
         }
     }
 
     // MARK: - Pure static: executable name resolution
 
-    /// Returns the executable name (last path component of the executable URL)
-    /// for the process with the given PID, or `nil` if the process is not found
-    /// in the running application list.
+    /// Returns the executable name (last path component) for the process with
+    /// the given PID, or `nil` if the name cannot be determined by any mechanism.
     ///
-    /// This is used by the denylist check. We use
-    /// `NSWorkspace.shared.runningApplications` rather than a direct syscall
-    /// because it already gives us a clean executable name without root access.
+    /// Resolution strategy (primary first):
+    ///
+    /// 1. `proc_pidpath()` — a Darwin syscall that returns the full filesystem
+    ///    path of the process's executable image directly from the kernel.
+    ///    Works for daemons, agents, and system processes (SecurityAgent,
+    ///    loginwindow, coreautha) that may not appear in NSWorkspace's app list
+    ///    because they are launchd services without a bundle or UI presentation.
+    ///
+    /// 2. `NSWorkspace.shared.runningApplications` bundle-ID supplement — used
+    ///    when proc_pidpath succeeds but returns an empty or slash-only path,
+    ///    which is theoretically possible for processes whose executable image
+    ///    has been unmapped. In practice proc_pidpath is almost always definitive.
+    ///
+    /// Returning `nil` means the process identity could not be established at all.
+    /// The call site treats `nil` as a fail-closed condition (refusal), so this
+    /// function should only return `nil` in genuine inability-to-resolve cases,
+    /// not as a "process looks safe" signal.
     ///
     /// Called from the MainActor context before dispatching to the AX queue,
     /// so NSWorkspace access is safe.
     static func resolveExecutableName(forProcessID processID: pid_t) -> String? {
-        return NSWorkspace.shared.runningApplications
-            .first { $0.processIdentifier == processID }
-            .flatMap { $0.executableURL?.lastPathComponent }
+        // Primary: proc_pidpath — works for daemons and security agents that
+        // NSWorkspace does not enumerate.
+        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let returnedLength = proc_pidpath(processID, &pathBuffer, UInt32(pathBuffer.count))
+        if returnedLength > 0 {
+            let fullPath = String(cString: pathBuffer)
+            let executableName = (fullPath as NSString).lastPathComponent
+            if !executableName.isEmpty && executableName != "/" {
+                return executableName
+            }
+        }
+
+        // Supplement: NSWorkspace bundle-based lookup for GUI apps whose
+        // proc_pidpath result was unexpectedly empty.
+        if let workspaceResult = NSWorkspace.shared.runningApplications
+            .first(where: { $0.processIdentifier == processID })
+            .flatMap({ $0.executableURL?.lastPathComponent }),
+           !workspaceResult.isEmpty {
+            return workspaceResult
+        }
+
+        // Cannot identify the process by any mechanism.
+        return nil
     }
 
     // MARK: - Pure static: re-validation decision
@@ -489,6 +567,26 @@ final class ActionExecutionService {
     /// - Returns: `.proceed`, `.staleTarget`, or `.aborted`.
     static func revalidateTargetElement(_ targetElement: AccessibleElement) -> RevalidationOutcome {
         let axHandle = targetElement.axElementHandle
+
+        // Tighten the messaging timeout before issuing attribute reads so a hung
+        // app does not stall the shared AX serial queue for the process-default ~6s.
+        //
+        // IMPORTANT: we set the timeout on a fresh app-level AX element
+        // (AXUIElementCreateApplication), NOT on the retained `axHandle`.
+        // Per AX documentation, a timeout set on the app element scopes all
+        // calls made to any descendant within that app process — so the reads
+        // below are still covered by the 1s limit.
+        //
+        // Why not set it on axHandle directly: the retained element handle in
+        // `targetElement.axElementHandle` is shared by all code that holds this
+        // AccessibleElement (attemptAXPressAction, isValueAttributeSettable,
+        // attemptAXValueSet, etc.). Mutating it here would permanently cap those
+        // later calls to 1s too, causing spurious failures for apps whose AX
+        // stack responds correctly but takes 1–2s (e.g. slow Electron main thread).
+        // A fresh app-level element is ephemeral — not stored, not reused — so the
+        // 1s cap is strictly local to this revalidation call.
+        let appElementForTimeout = AXUIElementCreateApplication(targetElement.owningProcessID)
+        AXUIElementSetMessagingTimeout(appElementForTimeout, 1.0)
 
         // Re-read role — verifies the handle is still alive and pointing to the
         // right kind of element. An AX error here (kAXErrorInvalidUIElement,
@@ -616,9 +714,14 @@ final class ActionExecutionService {
                 }
             }
 
-            // If chunkSize is now 0 (shouldn't happen with the ≥1 invariant on the
-            // chunk limit, but defensive), advance by 2 to consume the surrogate pair.
-            if chunkSize == 0 { chunkSize = 2 }
+            // If chunkSize is now 0 (the single remaining unit was a high surrogate
+            // with no following low surrogate — truncated/corrupt input), advance by
+            // min(2, remainingCount) rather than a bare 2. A bare 2 would slice
+            // beyond the array end when only 1 unit remains, causing a fatal
+            // index-out-of-range crash. Clamping to remainingCount is safe: we send
+            // the orphaned surrogate as-is (the target app will handle or discard it)
+            // rather than crashing.
+            if chunkSize == 0 { chunkSize = min(2, remainingCount) }
 
             let chunk = Array(utf16Units[currentIndex..<(currentIndex + chunkSize)])
             chunks.append(chunk)
@@ -660,11 +763,25 @@ final class ActionExecutionService {
     ///   Stage 1: AXUIElementPerformAction(kAXPressAction)
     ///            — Preferred for AX-discovered elements. Most reliable for native
     ///              macOS controls; fires the accessibility action directly.
+    ///              Returns `.performed` only when post-action AX verification
+    ///              confirms a state change; otherwise `.performedUnverified`.
     ///   Stage 2: CGEvent .leftMouseDown + .leftMouseUp posted to target PID
     ///            — Works for most native apps; Chromium web content sometimes
-    ///              rejects pid-targeted events.
+    ///              rejects pid-targeted events silently (post returns Void —
+    ///              there is no rejection signal). Always returns
+    ///              `.performedUnverified` because CGEvent post cannot be
+    ///              confirmed as accepted.
     ///   Stage 3: CGEvent via .cghidEventTap
     ///            — Last resort; the cursor visibly moves to the element center.
+    ///              Same blind-post limitation as Stage 2; always returns
+    ///              `.performedUnverified`.
+    ///
+    /// HONEST FALLBACK ORDER: Stages 2→3 are best-effort, not failure-driven.
+    /// Stage 3 runs only when Stage 2's post itself cannot be constructed (guard
+    /// failed to create the CGEvent), or when post-verification shows no effect
+    /// in contexts where verification is readable. For the common case where
+    /// Stage 2's events are silently rejected by Chromium web content, Stage 3
+    /// still runs and also posts blind — neither stage can confirm acceptance.
     ///
     /// Each stage is only attempted if the previous one failed or reported
     /// .unsupported. The abort flag is checked between stages.
@@ -701,6 +818,10 @@ final class ActionExecutionService {
         if isAbortFlagSet { return .aborted }
 
         // Stage 2: CGEvent click posted to target PID.
+        // CGEvent.postToPid returns Void — there is no signal if the target app
+        // silently drops the event (e.g. Chromium web content). We cannot confirm
+        // acceptance, so always return .performedUnverified regardless of what
+        // verifyClickActionIfPossible reports (handle still live ≠ click accepted).
         let clickCenter = CGPoint(x: target.cgFrame.midX, y: target.cgFrame.midY)
         let pidClickResult = await performSyntheticClickAtPoint(
             clickCenter,
@@ -708,21 +829,20 @@ final class ActionExecutionService {
         )
 
         if pidClickResult {
-            let wasVerified = await verifyClickActionIfPossible(target: target)
-            return wasVerified ? .performed : .performedUnverified
+            return .performedUnverified
         }
 
         if isAbortFlagSet { return .aborted }
 
         // Stage 3: CGEvent via HID tap (cursor visibly moves — last resort).
+        // Same blind-post limitation as Stage 2.
         let hidClickResult = await performSyntheticClickAtPoint(
             clickCenter,
             postTarget: .hidTap
         )
 
         if hidClickResult {
-            let wasVerified = await verifyClickActionIfPossible(target: target)
-            return wasVerified ? .performed : .performedUnverified
+            return .performedUnverified
         }
 
         return .failed(reason: "All click methods failed for this element.")
@@ -733,26 +853,27 @@ final class ActionExecutionService {
     /// Executes the type fallback chain for `target` with `textToType`.
     ///
     /// TYPE CHAIN (in order):
-    ///   Pre-step: Ensure the target element is focused. If it is not already the
-    ///             focused element, click it first using the click chain.
     ///   Stage 1: AXUIElementSetAttributeValue(kAXValueAttribute)
-    ///            — Layout-independent, instant. Only attempted when the attribute
-    ///              is settable. Verified by re-reading the value afterwards.
+    ///            — Layout-independent, instant. Does not require keyboard focus.
+    ///              Only attempted when the attribute is settable. Verified by
+    ///              re-reading the value afterwards.
     ///   Stage 2: CGEvent keyboard typing via CGEventKeyboardSetUnicodeString
     ///            — Chunked at ≤20 UTF-16 units; never splits surrogate pairs.
     ///              Inter-chunk delay prevents character dropping.
+    ///              Before posting events, `checkAndEnsureTargetIsFocused` verifies
+    ///              (and if needed, establishes) focus with a single click — this is
+    ///              the ONLY click issued for a TYPE action.
+    ///
+    /// NOTE: There is deliberately no unconditional pre-step click here. The
+    /// kAXValueAttribute path does not need focus. The keyboard path gates on
+    /// focus via `checkAndEnsureTargetIsFocused`, which issues at most one
+    /// click. A prior unconditional pre-step click was removed because it
+    /// caused two clicks total (pre-step + focus-retry inside checkAndEnsure)
+    /// on elements where the first click dismisses or toggles the field.
     private func executeTypeChain(
         target: AccessibleElement,
         textToType: String
     ) async -> ActionExecutionResult {
-
-        // Pre-step: focus the target field. Try clicking it first so the element
-        // is focused and ready to receive keyboard input. If click fails, we proceed
-        // to typing anyway — some text fields accept kAXValueAttribute without focus.
-        let focusClickResult = await executeClickChain(target: target)
-        // A click failure before typing is non-fatal — typing may still succeed
-        // via kAXValueAttribute. Log but do not return.
-        _ = focusClickResult
 
         if isAbortFlagSet { return .aborted }
 
@@ -788,6 +909,29 @@ final class ActionExecutionService {
         if isAbortFlagSet { return .aborted }
 
         // Stage 2: CGEvent keyboard typing.
+        // The kAXValueAttribute path above targets the element handle directly
+        // and does not require focus. The keyboard path, however, posts events
+        // to whatever element currently has system keyboard focus — if focus
+        // drifted away from the target (e.g. during the confirmation wait or the
+        // AXValueAttribute attempt), the keystrokes would land in the wrong field.
+        //
+        // Safety check: read the system-wide focused element and compare it to
+        // the target handle using CFEqual. If they do not match, attempt one more
+        // focus click and re-check. If the target still is not focused after the
+        // retry, refuse rather than typing into the wrong field.
+        //
+        // NOTE: The kAXValueAttribute set path above is UNAFFECTED — it targets
+        // the handle directly regardless of keyboard focus.
+        let focusCheckResult = await checkAndEnsureTargetIsFocused(target: target)
+        switch focusCheckResult {
+        case .failed(let reason):
+            return .failed(reason: reason)
+        case .aborted:
+            return .aborted
+        case .focused:
+            break // Target has focus — safe to type.
+        }
+
         let keyboardResult = await performCGEventKeyboardTyping(
             textToType: textToType
         )
@@ -1001,6 +1145,12 @@ final class ActionExecutionService {
             keyDownEvent.post(tap: .cgSessionEventTap)
             keyUpEvent.post(tap: .cgSessionEventTap)
 
+            // Check abort AFTER posting — we already sent this chunk, but we
+            // should stop before sending the next one rather than wait for the
+            // pre-chunk check at the top of the loop (which only runs after
+            // the sleep below). This tightens the abort response window.
+            if isAbortFlagSet { return .abortedMidChunk }
+
             // Inter-chunk delay: give the target app time to process each chunk
             // before the next arrives. Without this delay, fast text can cause
             // dropped characters in apps with synchronous input processing.
@@ -1010,6 +1160,89 @@ final class ActionExecutionService {
         }
 
         return .completedAllChunks
+    }
+
+    // MARK: - Focus safety check for keyboard typing
+
+    /// Possible outcomes of the pre-keyboard focus check.
+    private enum FocusCheckResult: Equatable {
+        /// The target element has keyboard focus — safe to proceed with typing.
+        case focused
+        /// The target could not be focused; contains the reason for refusal.
+        case failed(reason: String)
+        /// The abort flag was set while waiting for the re-focus click.
+        case aborted
+    }
+
+    /// Ensures `target` has keyboard focus before the CGEvent keyboard typing
+    /// stage posts events to the system-wide focused element.
+    ///
+    /// Strategy:
+    ///   1. Read `kAXFocusedUIElementAttribute` from the system-wide AX element.
+    ///   2. Compare the focused element handle to `target.axElementHandle` via
+    ///      `CFEqual` — handles to the same underlying element compare equal.
+    ///   3. If not focused, attempt one focus click via the existing click chain.
+    ///   4. Re-read the focused element and compare again.
+    ///   5. If still not focused, return `.failed` — refusing to type is safer
+    ///      than typing into an unintended field.
+    ///
+    /// MUST be called from an async context (the focus-click is async).
+    /// AX reads run on the AX serial queue via performOnAXSerialQueue.
+    private func checkAndEnsureTargetIsFocused(target: AccessibleElement) async -> FocusCheckResult {
+        // Read the system-wide focused element on the AX serial queue.
+        let isFocusedInitially = await AccessibilityElementInventoryService.shared
+            .performOnAXSerialQueue {
+                ActionExecutionService.isElementCurrentlyFocused(target.axElementHandle)
+            }
+
+        if isFocusedInitially { return .focused }
+
+        if isAbortFlagSet { return .aborted }
+
+        // Target is not focused — attempt one re-focus click using the existing chain.
+        // We discard the click result; focus is what matters, not whether the click
+        // itself was verified (the click may have come from a CGEvent stage and be
+        // unverified, but focus state is readable independently).
+        _ = await executeClickChain(target: target)
+
+        if isAbortFlagSet { return .aborted }
+
+        // Re-check focus after the click attempt.
+        let isFocusedAfterRetry = await AccessibilityElementInventoryService.shared
+            .performOnAXSerialQueue {
+                ActionExecutionService.isElementCurrentlyFocused(target.axElementHandle)
+            }
+
+        if isFocusedAfterRetry { return .focused }
+
+        return .failed(
+            reason: "The target field could not be focused. Clicky will not type into an unfocused element to avoid sending keystrokes to the wrong app."
+        )
+    }
+
+    /// Returns `true` if `elementHandle` is the current system-wide keyboard-focus
+    /// element as reported by the AX framework.
+    ///
+    /// Uses `CFEqual` for handle comparison — two AXUIElement references pointing
+    /// to the same underlying accessibility element compare equal even if they are
+    /// different Swift object identities.
+    ///
+    /// MUST be called on the AX serial queue.
+    static func isElementCurrentlyFocused(_ elementHandle: AXUIElement) -> Bool {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var focusedElementValue: AnyObject?
+        let readResult = AXUIElementCopyAttributeValue(
+            systemWideElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElementValue
+        )
+        guard readResult == .success,
+              let focusedElement = focusedElementValue else {
+            return false
+        }
+        // CFEqual compares AXUIElement handles by their underlying element identity,
+        // not by Swift reference equality — correct for AX handle comparison.
+        return CFEqual(focusedElement, elementHandle)
     }
 
     // MARK: - Post-action verification

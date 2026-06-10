@@ -173,7 +173,7 @@ final class ActionConfirmationPanelController {
     }
 
     deinit {
-        expiryTimer?.invalidate()
+        invalidateExpiryTimer()
     }
 
     // MARK: - Public API
@@ -184,7 +184,17 @@ final class ActionConfirmationPanelController {
     /// - Parameter targetElementAppKitFrame: The target element's frame in AppKit
     ///   global coordinates. The panel is positioned near (but not covering) the
     ///   element so the user can see what is highlighted.
+    ///
+    /// If the panel is already visible this call is a no-op. The caller
+    /// (CompanionManager) enforces one-at-a-time ownership, but this guard
+    /// makes the controller itself safe against accidental double-show which
+    /// would otherwise leak an NSPanel and start a second expiry timer.
     func show(near targetElementAppKitFrame: CGRect) {
+        guard panel == nil else {
+            print("[ActionConfirmationPanel] show() called while panel is already visible — ignoring duplicate call")
+            return
+        }
+
         previouslyKeyWindow = NSApp.keyWindow
 
         let panelWidth: CGFloat = 340
@@ -196,6 +206,14 @@ final class ActionConfirmationPanelController {
             backing: .buffered,
             defer: false
         )
+
+        // Prevent use-after-free: NSPanel defaults isReleasedWhenClosed=true, which
+        // causes the panel to deallocate on close(). We dismiss via orderOut (safe),
+        // but any future code path that calls close() (e.g. system-driven close on
+        // Space change) would crash if we still hold the panel reference. Setting
+        // false here makes teardown behavior consistent regardless of how the panel
+        // is eventually closed.
+        confirmationPanel.isReleasedWhenClosed = false
 
         confirmationPanel.isFloatingPanel = true
         // .popUpMenu puts the panel above all other windows including full-screen apps.
@@ -297,6 +315,12 @@ final class ActionConfirmationPanelController {
     private var keyEventMonitor: Any?
 
     private func installKeyEventMonitor(for targetPanel: NSPanel) {
+        // Guard against double-installation. If show() were somehow called twice
+        // before tearDown runs, a second addLocalMonitorForEvents call would register
+        // a second monitor that is never removed — leaking both the opaque token and
+        // the closure. The guard here makes installKeyEventMonitor idempotent.
+        guard keyEventMonitor == nil else { return }
+
         // Local monitor fires for events while the panel is key.
         // We watch .keyDown to intercept Return (confirm) and Esc (cancel).
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -406,9 +430,20 @@ final class ActionConfirmationPanelController {
 
     // MARK: - Private: tear-down
 
-    private func tearDown(restoreFocus: Bool) {
+    /// Invalidates and clears the expiry timer.
+    ///
+    /// Called from every dismissal path — tearDown, deinit — so there is a
+    /// single canonical place where the timer is stopped. This prevents a
+    /// scenario where a new dismissal path is added later and accidentally
+    /// omits timer cleanup, which would fire the expiry callback against an
+    /// already-dismissed panel.
+    private func invalidateExpiryTimer() {
         expiryTimer?.invalidate()
         expiryTimer = nil
+    }
+
+    private func tearDown(restoreFocus: Bool) {
+        invalidateExpiryTimer()
         removeKeyEventMonitor()
         panel?.orderOut(nil)
         panel = nil
@@ -432,6 +467,11 @@ final class ActionConfirmationPanelController {
     ///
     /// Falls back to centering on the primary screen if the target rect is
     /// zero (e.g. element was dropped before frame was available).
+    ///
+    /// The panel is clamped to the visible frame of the screen that contains
+    /// (or is nearest to) the target element's center. Previously this always
+    /// used the primary screen, which placed the panel on the wrong monitor
+    /// when the target element was on a secondary display.
     private func computePanelOrigin(
         targetElementAppKitFrame: CGRect,
         panelWidth: CGFloat,
@@ -444,10 +484,20 @@ final class ActionConfirmationPanelController {
             let panelX = targetElementAppKitFrame.minX
             let panelY = targetElementAppKitFrame.minY - panelHeight - gapBelowElement
 
-            // Clamp to the primary screen bounds so the panel is always visible.
-            let primaryScreenFrame = NSScreen.screens.first?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            let clampedX = min(max(panelX, primaryScreenFrame.minX), primaryScreenFrame.maxX - panelWidth)
-            let clampedY = min(max(panelY, primaryScreenFrame.minY), primaryScreenFrame.maxY - panelHeight)
+            // Find the screen whose frame contains the target element's center.
+            // Fall back to the nearest screen by distance if none contains it,
+            // and ultimately to the primary screen if NSScreen.screens is empty.
+            let targetCenter = CGPoint(
+                x: targetElementAppKitFrame.midX,
+                y: targetElementAppKitFrame.midY
+            )
+            let targetScreen = screenContaining(point: targetCenter)
+                ?? screenNearest(to: targetCenter)
+                ?? NSScreen.screens.first
+
+            let clampingFrame = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let clampedX = min(max(panelX, clampingFrame.minX), clampingFrame.maxX - panelWidth)
+            let clampedY = min(max(panelY, clampingFrame.minY), clampingFrame.maxY - panelHeight)
 
             return CGPoint(x: clampedX, y: clampedY)
         }
@@ -457,6 +507,29 @@ final class ActionConfirmationPanelController {
         let centerX = primaryScreenFrame.midX - panelWidth / 2
         let centerY = primaryScreenFrame.midY - panelHeight / 2
         return CGPoint(x: centerX, y: centerY)
+    }
+
+    /// Returns the first screen whose `frame` contains `point`, or nil if none does.
+    ///
+    /// Uses `NSScreen.frame` (full display bounds in AppKit global coordinates)
+    /// rather than `visibleFrame` so the hit-test covers the full monitor area
+    /// including the menu bar and dock stripe.
+    private func screenContaining(point: CGPoint) -> NSScreen? {
+        return NSScreen.screens.first { screen in
+            screen.frame.contains(point)
+        }
+    }
+
+    /// Returns the screen whose `frame` center is closest to `point`.
+    ///
+    /// Used as the fallback when no screen directly contains the target point
+    /// (e.g. a rounding artefact places the center just outside a monitor's frame).
+    private func screenNearest(to point: CGPoint) -> NSScreen? {
+        return NSScreen.screens.min { screenA, screenB in
+            let distanceToA = hypot(screenA.frame.midX - point.x, screenA.frame.midY - point.y)
+            let distanceToB = hypot(screenB.frame.midX - point.x, screenB.frame.midY - point.y)
+            return distanceToA < distanceToB
+        }
     }
 }
 
@@ -585,10 +658,10 @@ private struct ActionConfirmationContentView: View {
     let onConfirm: () -> Void
     let onCancel: () -> Void
 
-    /// Whether the arming delay has elapsed. Drives the Confirm button appearance.
+    /// Whether the arming delay has elapsed. Drives the Confirm button appearance
+    /// (visual only — the authoritative confirm gate is the timestamp check in
+    /// ActionConfirmationPanelController.isConfirmationArmed, not this flag).
     @State private var isArmed = false
-    /// Timer reference for the arming animation.
-    @State private var armingTimer: Timer? = nil
 
     var body: some View {
         ZStack {
@@ -686,24 +759,23 @@ private struct ActionConfirmationContentView: View {
             }
             .padding(DS.Spacing.lg)
         }
-        .onAppear {
-            // Start the arming delay timer. After 750ms we flip `isArmed = true`
-            // which both enables the Confirm button visually and enables
-            // the Return key handler in ActionConfirmationPanelController.
-            armingTimer = Timer.scheduledTimer(
-                withTimeInterval: ActionConfirmationPanelController.armingDelayInSeconds,
-                repeats: false
-            ) { _ in
-                DispatchQueue.main.async {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        isArmed = true
-                    }
-                }
+        .task {
+            // Use a structured-concurrency Task instead of a Timer stored in @State.
+            // A Timer in @State is not invalidated when the view is recreated during
+            // the arming window (e.g. parent re-renders), which can spawn duplicate
+            // timers with no cleanup. A .task modifier is automatically cancelled by
+            // SwiftUI when the view disappears or is recreated, so there is always
+            // exactly one pending arming delay per live view instance.
+            //
+            // NOTE: isArmed is presentation-only. The authoritative gate for both
+            // Return key and Confirm button is the timestamp-based
+            // ActionConfirmationPanelController.isConfirmationArmed check in the
+            // controller. This flag only controls the visual dimming of the button.
+            let nanoseconds = UInt64(ActionConfirmationPanelController.armingDelayInSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            withAnimation(.easeOut(duration: 0.15)) {
+                isArmed = true
             }
-        }
-        .onDisappear {
-            armingTimer?.invalidate()
-            armingTimer = nil
         }
     }
 }

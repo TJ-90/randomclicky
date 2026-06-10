@@ -242,9 +242,10 @@ struct WalkthroughControllerTests {
         #expect(resultEffect == .speakRetryHint("You clicked the wrong pane, try again"))
     }
 
-    @Test func secondStepNeedsRetryIncrementsRetryCountButDoesNotYetTriggerCap() {
-        // After first retry retryCount is 1 — second retry brings it to 2 which IS the cap.
-        // This test validates the boundary exactly: cap is 2, so reaching 2 triggers the offer.
+    @Test func retryCountReachingCapTriggersSkipOrCancelOffer() {
+        // After the first retry retryCount is 1. A second retry brings it to 2, which
+        // equals the cap. This test validates the boundary exactly: reaching the cap (2)
+        // must trigger offerSkipOrCancelAfterRetryCap, not merely increment the counter.
         let verifyingSnapshot = WalkthroughStateSnapshot(
             phase: .verifying,
             declaredSteps: makeThreeSteps(),

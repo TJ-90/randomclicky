@@ -273,7 +273,7 @@ struct WalkthroughStepChipView: View {
                 x: buddyCursorPosition.x + chipHorizontalOffset,
                 y: buddyCursorPosition.y + chipVerticalOffset
             )
-            .onChange(of: walkthroughPhase) { newPhase in
+            .onChange(of: walkthroughPhase) { _, newPhase in
                 updateEllipsisTimer(for: newPhase)
             }
             .onAppear {

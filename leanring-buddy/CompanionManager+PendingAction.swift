@@ -117,6 +117,11 @@ private final class PendingActionStateStorage {
     var hasSpokenActModeOffNoticeThisResponse: Bool = false
     /// Combine cancellable bag for kill-switch subscriptions.
     var killSwitchCancellables = Set<AnyCancellable>()
+    /// The Task spawned by handleActionConfirmed for the currently executing
+    /// action. Stored so the kill-switch handler can cancel it alongside
+    /// abortCurrentAction(), preventing TTS/queue mutations from racing the
+    /// kill-switch cleanup after the abort flag fires.
+    var currentActionExecutionTask: Task<Void, Never>?
 
     /// Backing stored property for the parallel resolved-element queue.
     ///
@@ -175,9 +180,18 @@ extension CompanionManager {
             .filter { $0 == .pressed }
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                // Only fire the kill switch if there are pending actions.
-                // If there are none, the normal PTT flow proceeds untouched.
-                guard let self, !self.pendingActionStorage.pendingActionQueue.isEmpty else { return }
+                // Fire the kill switch if there are pending actions OR an action
+                // is currently executing. The second condition is necessary because
+                // handleActionConfirmed dequeues the head action BEFORE spawning
+                // the async Task — so a single-action sequence leaves an empty
+                // queue while ActionExecutionService is still in-flight. Without
+                // this check, a PTT press during that window would return early
+                // here and never call abortCurrentAction, letting the in-flight
+                // action complete despite the user pressing the kill switch.
+                guard let self,
+                      !self.pendingActionStorage.pendingActionQueue.isEmpty
+                          || ActionExecutionService.shared.isActionCurrentlyRunning
+                else { return }
                 self.handleActModeKillSwitchFired(source: "PTT press")
             }
             .store(in: &pendingActionStorage.killSwitchCancellables)
@@ -204,6 +218,41 @@ extension CompanionManager {
     func processActionTagsAndEnqueue(
         textAfterWalkthroughStripping: String
     ) -> String {
+        // FIX 3: clear any leftover queued actions from a previous turn at the
+        // turn boundary. Each call to processActionTagsAndEnqueue represents a
+        // new Claude response — actions from a prior response were enqueued
+        // against a prior inventory and screen state. If the user triggered a new
+        // turn before confirming or cancelling those actions, the old entries must
+        // be discarded so they cannot resurface stale against the new inventory.
+        // This clear runs unconditionally (before the in-flight guard below) so a
+        // new turn always starts with a clean queue regardless of prior state.
+        // The in-flight guard below handles the separate case of a mid-execution
+        // new turn arriving while execute() is running.
+        if !pendingActionStorage.pendingActionQueue.isEmpty {
+            pendingActionStorage.pendingActionQueue = []
+            pendingActionStorage.resolvedElementQueue = []
+            clearPendingActionHighlight()
+            print("⚠️ Act mode: stale queue cleared at turn boundary")
+        }
+
+        // Guard: if an action is currently executing, discard any new actions
+        // that arrive (e.g. from a PTT turn the user initiated before the
+        // previous action finished). Silently enqueueing new actions on top of
+        // an in-flight execution would create a race — the in-flight action's
+        // queue-advance logic (presentNextPendingActionIfNeeded) runs after the
+        // async Task completes, so new items appended here could be presented
+        // twice or executed out of order. A brief spoken notice tells the user
+        // to wait and try again.
+        if ActionExecutionService.shared.isActionCurrentlyRunning {
+            print("⚠️ Act mode: new action tags arrived while an action is in-flight — discarding")
+            // Prepend a brief notice to the spoken text so the user knows why
+            // the action was not queued, then return the stripped text normally
+            // so the rest of Claude's response is still spoken.
+            let actionParseResultForStripping = ActionTagParser.parseActionTags(from: textAfterWalkthroughStripping)
+            let stillWorkingNotice = "still working on the previous action — "
+            return stillWorkingNotice + actionParseResultForStripping.strippedText
+        }
+
         // Reset the per-response notice flag so this response can emit the
         // notice if appropriate.
         pendingActionStorage.hasSpokenActModeOffNoticeThisResponse = false
@@ -333,6 +382,26 @@ extension CompanionManager {
     /// Also adds a HIGHLIGHT annotation for the target element so the user can
     /// see which element will be acted upon.
     private func presentNextPendingActionIfNeeded() {
+        // FIX 4: guard against presenting a second panel while one is already
+        // showing or while an action is executing. Without these guards, a second
+        // call (e.g. from enqueueResolvedAction racing a slow confirmation
+        // dismissal) would create a zombie panel with a leaked key monitor and
+        // two active confirmation windows for the same queue head.
+        // The post-execution continuation (handleActionConfirmed's success path)
+        // calls presentNextPendingActionIfNeeded after the execution Task
+        // completes, so the deferred presentation still fires correctly — the
+        // guards here only block a premature duplicate presentation, not the
+        // intended sequential presentation.
+        guard pendingActionStorage.currentConfirmationPanelController == nil else {
+            // A confirmation panel is already showing — do not create a second one.
+            return
+        }
+        guard !ActionExecutionService.shared.isActionCurrentlyRunning else {
+            // An action is in-flight — the post-execution callback will call
+            // presentNextPendingActionIfNeeded again once it completes.
+            return
+        }
+
         guard let headAction = PendingActionStateMachine.currentPendingAction(
             queue: pendingActionStorage.pendingActionQueue
         ) else {
@@ -409,7 +478,11 @@ extension CompanionManager {
             clearPendingActionHighlight()
             // Brief spoken acknowledgment on explicit cancel only (not expiry).
             Task {
-                try? await elevenLabsTTSClient.speakText("cancelled")
+                do {
+                    try await elevenLabsTTSClient.speakText("cancelled")
+                } catch {
+                    print("⚠️ Act mode cancel TTS error: \(error)")
+                }
             }
             print("🔒 Act mode: action cancelled by user")
 
@@ -476,8 +549,23 @@ extension CompanionManager {
         let actionKindStringForAnalytics = action.kind == .click ? "click" : "type"
 
         // Execute on the service (async, runs the AX safety chain).
-        Task {
+        // FIX 5: store the Task so the kill-switch handler can cancel it
+        // alongside abortCurrentAction(), preventing TTS/queue mutations from
+        // racing kill-switch cleanup after the abort flag fires.
+        let executionTask = Task {
             let executionResult = await ActionExecutionService.shared.execute(plannedAction)
+
+            // FIX 5: if the kill switch fired and cancelled this Task while
+            // execute() was in flight, do not speak feedback or mutate the queue
+            // — the kill-switch handler already cleaned up state. Checking here
+            // (after execute() returns) rather than inside execute() is correct
+            // because cancellation races the AX chain; the abort flag causes
+            // execute() to return .aborted, but Task.isCancelled provides an
+            // independent signal that the cancel came from the kill switch itself
+            // rather than from normal abort-flag flow.
+            if Task.isCancelled {
+                return
+            }
 
             // Speak the result honestly.
             let spokenResult = spokenFeedbackForExecutionResult(
@@ -496,7 +584,17 @@ extension CompanionManager {
                 // On success: if a walkthrough is active, route into verification
                 // as though the user had pressed "I did it".
                 if walkthroughWasActive {
-                    print("📋 Act mode: confirmed action completed — routing to walkthrough verification")
+                    // FIX 3: clear the remaining queue and highlight BEFORE routing
+                    // into the walkthrough verification turn. The verification turn
+                    // takes a fresh screenshot + inventory, so any queued actions
+                    // that were enqueued against the old inventory are now stale —
+                    // their element IDs and frames may no longer be valid. Letting
+                    // them survive into the post-verification presentNextPendingAction
+                    // call would execute stale actions against a changed screen state.
+                    pendingActionStorage.pendingActionQueue = []
+                    pendingActionStorage.resolvedElementQueue = []
+                    clearPendingActionHighlight()
+                    print("📋 Act mode: confirmed action completed — clearing stale queue before walkthrough verification")
                     runWalkthroughVerificationTurn()
                 } else {
                     // Not in a walkthrough: present the next queued action if any.
@@ -548,6 +646,7 @@ extension CompanionManager {
                 print("🔒 Act mode: queue cleared after aborted result")
             }
         }
+        pendingActionStorage.currentActionExecutionTask = executionTask
     }
 
     // MARK: - Kill-switch handler
@@ -558,16 +657,36 @@ extension CompanionManager {
     /// showing), and clears the entire pending queue.
     @MainActor
     func handleActModeKillSwitchFired(source: String) {
+        // FIX 1: also fire when the LAST action is in-flight. Once the queue is
+        // drained and the panel is dismissed, both the queue-empty and
+        // panel-nil checks would early-return here — but ActionExecutionService
+        // may still be executing that final confirmed action. Without this guard,
+        // pressing Esc/PTT after confirmation but before execution completes is
+        // silently ignored and the action runs to completion despite the user's
+        // kill-switch intent.
         guard !pendingActionStorage.pendingActionQueue.isEmpty
-              || pendingActionStorage.currentConfirmationPanelController != nil else {
-            // No pending actions — kill switch is a no-op for act mode.
+              || pendingActionStorage.currentConfirmationPanelController != nil
+              || ActionExecutionService.shared.isActionCurrentlyRunning else {
+            // No pending actions and nothing executing — kill switch is a no-op for act mode.
             return
         }
 
         print("🔒 Act mode kill switch fired (\(source)) — aborting \(pendingActionStorage.pendingActionQueue.count) pending action(s)")
 
         // Abort any in-flight action chain in ActionExecutionService.
-        ActionExecutionService.shared.abortCurrentAction()
+        // Gate behind isActionCurrentlyRunning so we never set the abort flag
+        // when no action is executing — a stale true flag would cause the next
+        // execute() call to return .aborted immediately before doing any work.
+        if ActionExecutionService.shared.isActionCurrentlyRunning {
+            ActionExecutionService.shared.abortCurrentAction()
+        }
+
+        // FIX 5: also cancel the stored execution Task so its post-execute body
+        // (TTS, queue mutations) cannot race this kill-switch cleanup. The abort
+        // flag above stops execute() mid-chain; cancelling the Task stops the
+        // surrounding async body (TTS speak, queue writes) after execute() returns.
+        pendingActionStorage.currentActionExecutionTask?.cancel()
+        pendingActionStorage.currentActionExecutionTask = nil
 
         // Dismiss the confirmation panel without calling back (the kill switch
         // IS the outcome — we handle everything here).
@@ -602,11 +721,16 @@ extension CompanionManager {
             allScreenFramesInAppKitCoordinates: NSScreen.screens.map { $0.frame }
         )
 
+        // FIX 12: set isPendingActionHighlight: true so clearPendingActionHighlight()
+        // can remove this entry by stable identity rather than by kind, preventing
+        // it from accidentally deleting Claude-authored HIGHLIGHT annotations that
+        // coexist in resolvedScreenAnnotations during a pending-action turn.
         let highlightAnnotation = ResolvedScreenAnnotation(
             kind: .highlight,
             rectInAppKitGlobalCoordinates: element.appKitFrame,
             displayFrameOfTargetScreen: targetScreenFrame,
-            label: element.title
+            label: element.title,
+            isPendingActionHighlight: true
         )
 
         // Append the highlight to the current resolved annotations. This mirrors
@@ -618,11 +742,12 @@ extension CompanionManager {
 
     /// Removes the pending-action highlight from the resolved annotations.
     ///
-    /// We identify the highlight by `kind == .highlight`. This is safe because
-    /// the annotation pipeline only ever adds highlight annotations from pending-
-    /// action state; walkthrough step annotations use BOX/CIRCLE/ARROW.
+    /// FIX 12: identifies the pending-action highlight by isPendingActionHighlight
+    /// rather than kind == .highlight. This prevents accidentally removing a
+    /// Claude-authored HIGHLIGHT annotation that coexists in the array during
+    /// a pending-action turn — the two are now distinguishable by stable identity.
     private func clearPendingActionHighlight() {
-        resolvedScreenAnnotations.removeAll { $0.kind == .highlight }
+        resolvedScreenAnnotations.removeAll { $0.isPendingActionHighlight }
     }
 
     // MARK: - Spoken feedback for execution results

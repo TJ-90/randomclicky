@@ -503,6 +503,117 @@ struct ActionExecutionServiceRefusalTests {
         }
     }
 
+    /// A TYPE action whose text contains U+0085 (NEL, NEXT LINE) must be refused.
+    /// NEL is a C1 control and is treated as a newline by some text systems.
+    @Test func typingTextWithNELCharacterYieldsRefused() {
+        let element = makeTestElement(role: "AXTextField")
+        let action = PlannedElementAction.type(
+            target: element,
+            textToType: "line1\u{0085}line2"
+        )
+
+        let result = ActionExecutionService.evaluateHardRefusals(
+            action: action,
+            targetElement: element
+        )
+
+        if case .refused = result {
+            // Expected.
+        } else {
+            Issue.record("Expected .refused for text containing NEL (U+0085), got \(String(describing: result))")
+        }
+    }
+
+    /// A TYPE action whose text contains U+009F (APPLICATION PROGRAM COMMAND) must be refused.
+    /// U+009F is the last C1 control character.
+    @Test func typingTextWithU009FCharacterYieldsRefused() {
+        let element = makeTestElement(role: "AXTextField")
+        let action = PlannedElementAction.type(
+            target: element,
+            textToType: "abc\u{009F}def"
+        )
+
+        let result = ActionExecutionService.evaluateHardRefusals(
+            action: action,
+            targetElement: element
+        )
+
+        if case .refused = result {
+            // Expected.
+        } else {
+            Issue.record("Expected .refused for text containing U+009F, got \(String(describing: result))")
+        }
+    }
+
+    /// A TYPE action whose text contains U+2028 (LINE SEPARATOR) must be refused.
+    /// U+2028 is a Unicode line-terminator that some hosts treat as a newline.
+    @Test func typingTextWithLineSeparatorU2028YieldsRefused() {
+        let element = makeTestElement(role: "AXTextField")
+        let action = PlannedElementAction.type(
+            target: element,
+            textToType: "before\u{2028}after"
+        )
+
+        let result = ActionExecutionService.evaluateHardRefusals(
+            action: action,
+            targetElement: element
+        )
+
+        if case .refused = result {
+            // Expected.
+        } else {
+            Issue.record("Expected .refused for text containing LINE SEPARATOR (U+2028), got \(String(describing: result))")
+        }
+    }
+
+    /// A TYPE action whose text contains U+2029 (PARAGRAPH SEPARATOR) must be refused.
+    @Test func typingTextWithParagraphSeparatorU2029YieldsRefused() {
+        let element = makeTestElement(role: "AXTextField")
+        let action = PlannedElementAction.type(
+            target: element,
+            textToType: "before\u{2029}after"
+        )
+
+        let result = ActionExecutionService.evaluateHardRefusals(
+            action: action,
+            targetElement: element
+        )
+
+        if case .refused = result {
+            // Expected.
+        } else {
+            Issue.record("Expected .refused for text containing PARAGRAPH SEPARATOR (U+2029), got \(String(describing: result))")
+        }
+    }
+
+    /// A TYPE action with text containing accented characters (é), emoji, and CJK
+    /// must NOT be refused by the control-character check. These are ordinary
+    /// printable characters and must pass through without a refusal.
+    @Test func typingTextWithAccentedEmojiAndCJKCharactersIsNotRefusedByControlCharacterCheck() {
+        let element = makeTestElement(role: "AXTextField")
+        let action = PlannedElementAction.type(
+            target: element,
+            textToType: "café 😀 日本語"
+        )
+
+        // Only checking the control-character predicate in isolation — other rules
+        // (secure field, denylist) do not apply to this clean AXTextField element.
+        let hasControlChars = ActionExecutionService.textContainsControlCharacters("café 😀 日本語")
+        #expect(hasControlChars == false)
+
+        // Also verify the full refusal gate does not fire for this input.
+        let result = ActionExecutionService.evaluateHardRefusals(
+            action: action,
+            targetElement: element
+        )
+        if let refusal = result, case .refused(let reason) = refusal {
+            let isSecureInputRefusal = reason.lowercased().contains("secure keyboard")
+            if !isSecureInputRefusal {
+                Issue.record("Unexpected refusal for text with accented/emoji/CJK characters: \(reason)")
+            }
+        }
+    }
+
     /// Clean text with no control characters must not be refused by the control-
     /// character check. (Other rules may still fire; we just verify this one passes.)
     @Test func typingTextWithNoControlCharactersPassesControlCharacterCheck() {
@@ -603,6 +714,13 @@ struct ActionExecutionServiceRefusalTests {
             }
         }
         // If result is nil, all hard refusals passed — that is the expected outcome.
+        // We intentionally do NOT assert `result == nil` here because Rule 2
+        // (secure keyboard input mode) is environment-dependent: on a machine where
+        // a password manager or system password dialog holds secure input at test
+        // time, evaluateHardRefusals returns .refused(reason: "secure keyboard…")
+        // and a hard assertion would produce a spurious CI failure. The Issue.record
+        // call above already flags any unexpected refusal that is NOT the documented
+        // secure-input case, which is sufficient coverage without the false red.
     }
 }
 
@@ -656,6 +774,44 @@ struct ActionExecutionServiceControlCharacterTests {
     @Test func unicodeLettersAreNotControlCharacters() {
         // Non-ASCII printable characters (accented letters, CJK, etc.)
         #expect(ActionExecutionService.textContainsControlCharacters("Héllo Wörld") == false)
+        #expect(ActionExecutionService.textContainsControlCharacters("日本語テスト") == false)
+    }
+
+    // MARK: - C1 controls (U+0080–U+009F) and Unicode line/paragraph separators
+
+    /// U+0085 (NEXT LINE, NEL) is a C1 control character — must be refused.
+    @Test func nelCharacterU0085IsAControlCharacter() {
+        #expect(ActionExecutionService.textContainsControlCharacters("\u{0085}") == true)
+    }
+
+    /// U+009F (APPLICATION PROGRAM COMMAND) is the last C1 control character — must be refused.
+    @Test func lastC1ControlCharacterU009FIsAControlCharacter() {
+        #expect(ActionExecutionService.textContainsControlCharacters("\u{009F}") == true)
+    }
+
+    /// U+2028 (LINE SEPARATOR) must be refused — it is a Unicode line-terminator
+    /// that some parsers treat as a newline and could cause unintended form submissions.
+    @Test func lineSeparatorU2028IsAControlCharacter() {
+        #expect(ActionExecutionService.textContainsControlCharacters("\u{2028}") == true)
+    }
+
+    /// U+2029 (PARAGRAPH SEPARATOR) must be refused for the same reason as U+2028.
+    @Test func paragraphSeparatorU2029IsAControlCharacter() {
+        #expect(ActionExecutionService.textContainsControlCharacters("\u{2029}") == true)
+    }
+
+    /// Accented Latin characters (é, ö) are NOT control characters.
+    @Test func accentedLatinCharactersAreNotControlCharacters() {
+        #expect(ActionExecutionService.textContainsControlCharacters("café résumé") == false)
+    }
+
+    /// Emoji are NOT control characters.
+    @Test func emojiCharactersAreNotControlCharacters() {
+        #expect(ActionExecutionService.textContainsControlCharacters("Hello 🎉 World 🚀") == false)
+    }
+
+    /// CJK characters are NOT control characters.
+    @Test func cjkCharactersAreNotControlCharacters() {
         #expect(ActionExecutionService.textContainsControlCharacters("日本語テスト") == false)
     }
 }

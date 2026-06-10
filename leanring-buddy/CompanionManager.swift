@@ -459,8 +459,15 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // Non-walkthrough path: annotations share the pointing lifecycle as before.
-        resolvedScreenAnnotations = []
+        // Non-walkthrough path: remove Claude-authored annotations (they share the
+        // pointing lifecycle) but PRESERVE any pending-action highlight so it stays
+        // visible for the full confirmation window. The pending-action highlight is
+        // owned by act-mode state (clearPendingActionHighlight removes it) — clearing
+        // it here when the buddy flies home would leave the confirmation panel without
+        // its visual anchor. This mirrors the walkthrough-phase preservation above.
+        // FIX 12: use isPendingActionHighlight to identify which entries to keep.
+        let pendingActionHighlightsToPreserve = resolvedScreenAnnotations.filter { $0.isPendingActionHighlight }
+        resolvedScreenAnnotations = pendingActionHighlightsToPreserve
     }
 
     /// Clears the pointing trio AND all annotation shapes unconditionally.
@@ -768,8 +775,21 @@ final class CompanionManager: ObservableObject {
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
-            // After cancelling, notify the controller if a verification turn was interrupted.
-            if walkthroughPhaseBeforeCancel == .verifying {
+            // After cancelling, notify the controller so it does not get stranded
+            // in a phase that has no active turn to drive it forward.
+            //
+            // FIX 8: previously only .verifying applied .turnInterrupted. But a PTT
+            // press during .presentingStep (step TTS playing) also cancels the task
+            // and leaves the controller stuck in .presentingStep with no active turn.
+            // Apply .turnInterrupted for .presentingStep too — the step was at least
+            // partially spoken; the safe state is to wait for the user to act rather
+            // than discard the step entirely. WalkthroughController.transition handles
+            // .presentingStep + .turnInterrupted → .awaitingUserAction (retry preserved).
+            //
+            // .verifying: interrupted before a verdict — return to awaiting.
+            // .presentingStep: TTS interrupted mid-speech — return to awaiting.
+            if walkthroughPhaseBeforeCancel == .verifying
+                || walkthroughPhaseBeforeCancel == .presentingStep {
                 walkthroughController.apply(event: .turnInterrupted)
             }
 
@@ -899,6 +919,19 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Act-mode prompt grammar (U12)
 
+    /// The paragraph appended to the system prompt when act mode is DISABLED.
+    ///
+    /// Kept separate from `companionVoiceResponseSystemPromptBase` so that when
+    /// act mode is ON the base prompt does NOT contain contradictory "you cannot
+    /// click" instructions alongside the act-mode-on grammar paragraph.
+    ///
+    /// Voice matches the rest of the prompt: lowercase, casual.
+    private static let actModeOffParagraph = """
+
+    act mode (currently off):
+    you cannot click buttons or type text on the user's behalf right now — act mode is off. if the user asks you to "click", "press", "type", "fill in", or otherwise do something for them, tell them you can't do that with act mode off, and guide them on how to do it themselves instead. don't be apologetic or long-winded — just redirect naturally: "i can't click for you right now, but here's how to do it yourself..." if they want you to take actions, they can enable act mode from the clicky panel.
+    """
+
     /// The paragraph appended to the system prompt when act mode is enabled.
     ///
     /// DESIGN: the CLICK/TYPE grammar is ONLY advertised when act mode is on.
@@ -950,7 +983,7 @@ final class CompanionManager: ObservableObject {
     static func companionVoiceResponseSystemPrompt(actModeEnabled: Bool) -> String {
         actModeEnabled
             ? companionVoiceResponseSystemPromptBase + actModeGrammarParagraph
-            : companionVoiceResponseSystemPromptBase
+            : companionVoiceResponseSystemPromptBase + actModeOffParagraph
     }
 
     // MARK: - AI Response Pipeline
@@ -1014,8 +1047,16 @@ final class CompanionManager: ObservableObject {
                 // current turn: its frames describe a screen state that may no
                 // longer match the screenshot, and the E-id resolver only resolves
                 // against the inventory captured for this interaction.
+                // Screenshots and AX walk run concurrently. async let is fine for
+                // screenCapturesResult because it is awaited directly below (legal).
+                // The AX walk is called directly inside the child task instead of via
+                // async let, because Swift forbids capturing an async-let binding in a
+                // Sendable child-task closure. The walk's background-completion behaviour
+                // is preserved: AccessibilityElementInventoryService runs the walk body
+                // on its own serial dispatch queue, which ignores Swift task cancellation,
+                // so the walk continues warming Electron trees even after the group
+                // cancels the child task below.
                 async let screenCapturesResult = CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-                async let axInventoryResult = AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
 
                 // Race the AX walk against a 1.5s deadline. On timeout we synthesise
                 // a .timedOut outcome so analytics can track the miss separately from
@@ -1031,8 +1072,12 @@ final class CompanionManager: ObservableObject {
                     let raceResult = await withTaskGroup(
                         of: AccessibilityElementInventory?.self
                     ) { group in
+                        // Call the service directly inside the child task — NOT via
+                        // async let. Swift prohibits capturing an async-let binding in
+                        // a Sendable closure (SE-0304); calling the service here avoids
+                        // that restriction while keeping true concurrency with screenshots.
                         group.addTask {
-                            return await axInventoryResult
+                            return await AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
                         }
                         group.addTask {
                             try? await Task.sleep(nanoseconds: axInventoryTimeoutInNanoseconds)
@@ -1042,6 +1087,20 @@ final class CompanionManager: ObservableObject {
                         }
                         // Take the first result; cancel the remaining branch.
                         let firstResult = await group.next()
+                        // FIX 3: when the sleep sentinel wins it returns nil, so
+                        // group.next() yields .some(.none) — NOT nil (nil from
+                        // group.next() means the group is exhausted, which cannot
+                        // happen with 2 live tasks). Use pattern matching to detect
+                        // the timeout case and drain one more result: the real walk
+                        // may have completed microseconds after the sleep fired.
+                        // cancelAll() marks the walk task cancelled but does NOT
+                        // discard a result that already arrived; the second await
+                        // returns promptly once the task is cancelled or done.
+                        if case .some(.none) = firstResult {
+                            group.cancelAll()
+                            let secondResult = await group.next()
+                            return secondResult ?? nil
+                        }
                         group.cancelAll()
                         return firstResult ?? nil
                     }
@@ -1401,24 +1460,43 @@ final class CompanionManager: ObservableObject {
                 // new turn (which resets the property at the top of sendTranscript...)
                 // cannot race this loop.
                 if let stepToPresent = pendingWalkthroughStepAfterTTS {
+                    // Snapshot the step's annotations NOW — before the async TTS wait.
+                    // A help turn that fires and completes DURING TTS playback sets
+                    // resolvedScreenAnnotations to help-response overlays. If we snapshot
+                    // after the await, stepAnnotationsForActiveWalkthrough would capture
+                    // those help annotations instead of the step's BOX/CIRCLE/ARROW shapes,
+                    // causing wrong overlays when the user acts on the step.
+                    // resolvedScreenAnnotations is set synchronously above (before any await
+                    // in this turn), so this snapshot is always the step's own annotations.
+                    let stepAnnotationsSnapshot = resolvedScreenAnnotations
+
                     // Wait for TTS audio to finish before signalling step presented.
-                    while elevenLabsTTSClient.isPlaying {
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                        guard !Task.isCancelled else { break }
-                    }
+                    // waitForTTSPlaybackToFinish uses do/catch so cancellation is not
+                    // silently swallowed; it also applies a 30s ceiling so a stuck
+                    // isPlaying flag can never spin this loop forever.
+                    await waitForTTSPlaybackToFinish()
                     if !Task.isCancelled {
                         pendingWalkthroughStepAfterTTS = nil
-                        walkthroughController.apply(event: .stepPresented(step: WalkthroughStep(
-                            stepNumber: stepToPresent.stepNumber,
-                            instruction: stepToPresent.instruction
-                        )))
-                        // Store the step's resolved annotations so we can restore
-                        // them after a help turn replaces resolvedScreenAnnotations
-                        // with help-response annotations. This snapshot is taken
-                        // immediately after TTS ends — the step's pointing + annotation
-                        // state is exactly what the user sees on screen right now.
-                        stepAnnotationsForActiveWalkthrough = resolvedScreenAnnotations
-                        print("📋 Walkthrough step \(stepToPresent.stepNumber) presented — now awaitingUserAction")
+                        // FIX 9: only apply .stepPresented when the controller is actually
+                        // in .presentingStep. A help turn can contain a stray [STEP:] tag
+                        // (e.g. the user asks about a future step); that tag is stripped
+                        // from TTS but would incorrectly advance the controller and
+                        // overwrite stepAnnotationsForActiveWalkthrough if unchecked.
+                        // The transition function itself ignores .stepPresented from other
+                        // phases, but the annotation snapshot must also be guarded.
+                        if walkthroughController.phase == .presentingStep {
+                            walkthroughController.apply(event: .stepPresented(step: WalkthroughStep(
+                                stepNumber: stepToPresent.stepNumber,
+                                instruction: stepToPresent.instruction
+                            )))
+                            // Store the pre-TTS snapshot of the step's resolved annotations
+                            // so we can restore them after a help turn replaces
+                            // resolvedScreenAnnotations with help-response annotations.
+                            stepAnnotationsForActiveWalkthrough = stepAnnotationsSnapshot
+                            print("📋 Walkthrough step \(stepToPresent.stepNumber) presented — now awaitingUserAction")
+                        } else {
+                            print("📋 Walkthrough: skipping stepPresented — phase is \(walkthroughController.phase), not presentingStep (FIX 9)")
+                        }
                     }
                 } else if walkthroughController.phase == .awaitingUserAction
                             && !stepAnnotationsForActiveWalkthrough.isEmpty {
@@ -1430,10 +1508,7 @@ final class CompanionManager: ObservableObject {
                     // We wait for TTS to finish first so the help response's own
                     // annotations (if any) don't disappear mid-speech; the step
                     // annotations reappear as a natural handoff once the help is done.
-                    while elevenLabsTTSClient.isPlaying {
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                        guard !Task.isCancelled else { break }
-                    }
+                    await waitForTTSPlaybackToFinish()
                     if !Task.isCancelled {
                         resolvedScreenAnnotations = stepAnnotationsForActiveWalkthrough
                         print("📋 Walkthrough: step annotations restored after help turn")
@@ -1477,25 +1552,84 @@ final class CompanionManager: ObservableObject {
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard !Task.isCancelled else { return }
-            }
+            // Wait for TTS audio to finish playing. The shared helper uses do/catch
+            // so a cancelled task does not keep spinning (try? would swallow
+            // CancellationError). The 30s ceiling prevents a stuck isPlaying from
+            // blocking this task indefinitely.
+            await waitForTTSPlaybackToFinish()
+            guard !Task.isCancelled else { return }
 
             // Wait for pointing animation to finish (location is cleared
-            // when the buddy flies back to the cursor)
+            // when the buddy flies back to the cursor). 10s ceiling prevents a
+            // stuck detectedElementScreenLocation from spinning forever.
+            let maximumPointingWaitIterations = 50 // 50 * 200ms = 10s
+            var pointingPollIterations = 0
             while detectedElementScreenLocation != nil {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard !Task.isCancelled else { return }
+                guard pointingPollIterations < maximumPointingWaitIterations else {
+                    print("⚠️ scheduleTransientHideIfNeeded: pointing-wait ceiling reached, proceeding with hide")
+                    break
+                }
+                do {
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                } catch {
+                    return
+                }
+                pointingPollIterations += 1
             }
+            guard !Task.isCancelled else { return }
 
             // Pause 1s after everything finishes, then fade out
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch {
+                return
+            }
             guard !Task.isCancelled else { return }
             overlayWindowManager.fadeOutAndHideOverlay()
             isOverlayVisible = false
         }
+    }
+
+    /// Polls until ElevenLabs TTS playback finishes, the Swift task is cancelled,
+    /// or the given total-wait ceiling (in seconds) is exceeded — whichever comes
+    /// first.
+    ///
+    /// Using `try?` on `Task.sleep` is intentionally avoided here: discarding the
+    /// error silently swallows `CancellationError`, causing a cancelled task to keep
+    /// spinning indefinitely. Instead we use a do/catch that breaks out of the loop
+    /// on any error (including cancellation). The ceiling prevents a pathological
+    /// `isPlaying` flag that never clears from blocking the pipeline forever.
+    ///
+    /// - Parameter maximumWaitInSeconds: Upper bound on how long to poll. Defaults
+    ///   to 30 seconds — generous enough for the longest expected TTS response while
+    ///   still providing a hard exit if the ElevenLabs client gets into a bad state.
+    /// - Returns: `true` if playback finished normally, `false` if the task was
+    ///   cancelled or the ceiling was reached (callers should check `Task.isCancelled`
+    ///   on `false` to distinguish the two cases if needed).
+    @discardableResult
+    private func waitForTTSPlaybackToFinish(
+        maximumWaitInSeconds: Double = 30.0
+    ) async -> Bool {
+        let pollIntervalInNanoseconds: UInt64 = 200_000_000 // 200 ms
+        let maximumIterations = Int(maximumWaitInSeconds * 5) // 5 polls per second
+
+        var iterationsElapsed = 0
+        while elevenLabsTTSClient.isPlaying {
+            guard iterationsElapsed < maximumIterations else {
+                // Ceiling reached — TTS appears stuck; exit to avoid spinning forever.
+                print("⚠️ waitForTTSPlaybackToFinish: ceiling of \(maximumWaitInSeconds)s reached, exiting poll loop")
+                return false
+            }
+            do {
+                try await Task.sleep(nanoseconds: pollIntervalInNanoseconds)
+            } catch {
+                // CancellationError or any other error — exit the loop immediately.
+                // Callers must check Task.isCancelled after this returns false.
+                return false
+            }
+            iterationsElapsed += 1
+        }
+        return true
     }
 
     /// Speaks a hardcoded error message using macOS system TTS when API
@@ -1516,31 +1650,65 @@ final class CompanionManager: ObservableObject {
     /// one implementation — avoiding duplication of the async let + taskGroup
     /// race pattern.
     ///
+    /// FIX 4: this helper also assigns `inventoryForCurrentInteraction` so every
+    /// caller keeps the property in sync automatically. Without the assignment here,
+    /// a future caller that forgets the manual write would resolve element IDs against
+    /// stale inventory from a prior turn. The main pipeline does NOT call this helper
+    /// (it has its own inline race) and assigns `inventoryForCurrentInteraction`
+    /// itself, so the assignment happens exactly once per turn on both code paths.
+    ///
     /// Returns (screenCaptures, inventory). On AX walk timeout inventory is nil;
     /// on screenshot failure the method throws.
     private func captureScreenshotsAndInventory() async throws -> (
         screenCaptures: [CompanionScreenCapture],
         inventory: AccessibilityElementInventory?
     ) {
+        // Screenshots and AX walk run concurrently. async let is legal for
+        // screenCapturesResult because it is awaited directly (not captured in a
+        // Sendable closure). The AX walk is called directly inside the child task
+        // to avoid the SE-0304 restriction on capturing async-let bindings in
+        // Sendable closures. The walk's background-completion behaviour is preserved:
+        // the service runs on its own serial dispatch queue and ignores Swift task
+        // cancellation, so it keeps warming trees after the group cancels the child.
         async let screenCapturesResult = CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-        async let axInventoryResult = AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
 
         let axInventoryTimeoutInNanoseconds: UInt64 = 1_500_000_000
 
         let inventoryOrNil: AccessibilityElementInventory? = await withTaskGroup(
             of: AccessibilityElementInventory?.self
         ) { group in
-            group.addTask { return await axInventoryResult }
+            // Call the service directly — NOT via async let. See Fix 1 comment above.
+            group.addTask {
+                return await AccessibilityElementInventoryService.shared.captureInventoryOfFrontmostWindow()
+            }
             group.addTask {
                 try? await Task.sleep(nanoseconds: axInventoryTimeoutInNanoseconds)
                 return nil
             }
             let firstResult = await group.next()
+            // FIX 3 (same as main pipeline): the sleep sentinel returns nil, so
+            // group.next() yields .some(.none) — NOT nil. Use pattern matching
+            // to detect the timeout case and drain one more result before
+            // concluding timeout — the real walk may have completed microseconds
+            // after the sleep fired. See the main pipeline comment for details.
+            if case .some(.none) = firstResult {
+                group.cancelAll()
+                let secondResult = await group.next()
+                return secondResult ?? nil
+            }
             group.cancelAll()
             return firstResult ?? nil
         }
 
         let screenCaptures = try await screenCapturesResult
+
+        // FIX 4: assign inventoryForCurrentInteraction here so every caller
+        // automatically resolves element IDs against the inventory for THIS turn.
+        // The main pipeline assigns this itself; callers of this helper must not
+        // duplicate the assignment (they will read `inventory` from the return tuple
+        // for any additional local use, but the property is already set here).
+        inventoryForCurrentInteraction = inventoryOrNil
+
         return (screenCaptures: screenCaptures, inventory: inventoryOrNil)
     }
 
@@ -1562,17 +1730,25 @@ final class CompanionManager: ObservableObject {
     ///     This prevents the walkthrough from being stranded in .verifying when Claude
     ///     omits the protocol tag (model drift, network truncation, etc.).
     func runWalkthroughVerificationTurn() {
-        walkthroughController.apply(event: .userSignaledStepDone)
-
-        let snapshot = walkthroughController.currentSnapshot
-        let currentStepIndex = snapshot.currentStepIndex
-        guard currentStepIndex < snapshot.declaredSteps.count else {
-            print("⚠️ Walkthrough: runWalkthroughVerificationTurn called with out-of-bounds step index")
-            walkthroughController.apply(event: .turnInterrupted)
+        // FIX 5: perform bounds check BEFORE applying .userSignaledStepDone.
+        // Previously, applying the event first moved the controller into .verifying
+        // and then bailing on the guard left it stranded there — subsequent "I did it"
+        // presses would trigger .userSignaledStepDone from .verifying (invalid) and
+        // be silently dropped.
+        let snapshotBeforeSignal = walkthroughController.currentSnapshot
+        let currentStepIndex = snapshotBeforeSignal.currentStepIndex
+        guard currentStepIndex < snapshotBeforeSignal.declaredSteps.count else {
+            print("⚠️ Walkthrough: runWalkthroughVerificationTurn called with out-of-bounds step index — ignoring")
             return
         }
-        let currentStep = snapshot.declaredSteps[currentStepIndex]
-        let stepListForPrompt = snapshot.declaredSteps
+        // Safe to subscript directly — the guard above guarantees the index is valid
+        // and WalkthroughStep is a non-optional value type.
+        let currentStep = snapshotBeforeSignal.declaredSteps[currentStepIndex]
+
+        // Bounds are valid — now signal step done and transition to .verifying.
+        walkthroughController.apply(event: .userSignaledStepDone)
+
+        let stepListForPrompt = snapshotBeforeSignal.declaredSteps
 
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
@@ -1583,10 +1759,10 @@ final class CompanionManager: ObservableObject {
 
             do {
                 let (screenCaptures, inventory) = try await captureScreenshotsAndInventory()
+                // FIX 4: inventoryForCurrentInteraction is now assigned inside
+                // captureScreenshotsAndInventory() — no manual assignment needed here.
 
                 guard !Task.isCancelled else { return }
-
-                inventoryForCurrentInteraction = inventory
 
                 let labeledImages = screenCaptures.map { capture in
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
@@ -1642,8 +1818,24 @@ final class CompanionManager: ObservableObject {
                     from: walkthroughParseResult.strippedText
                 )
 
-                // Annotations + walkthrough + verify tags all stripped; POINT still present.
-                let pointParseResult = Self.parsePointingCoordinates(from: verdictParseResult.strippedText)
+                // --- Strip action tags from the verification response (FIX 10) ---
+                // Verification responses should not contain CLICK/TYPE tags, but if
+                // Claude emits them (model drift, prompt bleed) they would be spoken
+                // aloud by TTS and saved to conversation history without this step.
+                //
+                // We use ActionTagParser.parseActionTags directly (strip-only) rather
+                // than routing through processActionTagsAndEnqueue, because that
+                // function's in-flight guard prepends "still working on the previous
+                // action — " to the return value when isActionCurrentlyRunning is true.
+                // In a verification turn that prefix would corrupt the spoken verdict
+                // and the conversation history entry. Tags are simply discarded here —
+                // a verification turn must never enqueue act-mode actions.
+                let verificationResponseAfterActionTagStripping = ActionTagParser.parseActionTags(
+                    from: verdictParseResult.strippedText
+                ).strippedText
+
+                // Annotations + walkthrough + verify + action tags all stripped; POINT still present.
+                let pointParseResult = Self.parsePointingCoordinates(from: verificationResponseAfterActionTagStripping)
                 let spokenText = pointParseResult.spokenText
 
                 // --- Resolve pointing for the verification response ---
@@ -1722,11 +1914,10 @@ final class CompanionManager: ObservableObject {
                     }
                     // If there is a next step in this response, wait for TTS to finish
                     // then apply stepPresented so the controller reaches awaitingUserAction.
+                    // Use the shared helper to avoid try?-swallowed cancellation and
+                    // to apply the 30s ceiling against a stuck isPlaying flag.
                     if let stepToPresent = pendingWalkthroughStepAfterTTS {
-                        while elevenLabsTTSClient.isPlaying {
-                            try? await Task.sleep(nanoseconds: 200_000_000)
-                            guard !Task.isCancelled else { break }
-                        }
+                        await waitForTTSPlaybackToFinish()
                         if !Task.isCancelled {
                             pendingWalkthroughStepAfterTTS = nil
                             walkthroughController.apply(event: .stepPresented(step: WalkthroughStep(
@@ -2126,6 +2317,24 @@ final class CompanionManager: ObservableObject {
         let displayFrameOfTargetScreen: CGRect
         /// Optional short label shown as a chip near the annotation shape.
         let label: String?
+        /// FIX 12: True when this annotation was synthesised by the pending-action
+        /// pipeline (publishPendingActionHighlight) rather than parsed from a Claude
+        /// response. This stable identity field lets clearPendingActionHighlight()
+        /// remove ONLY the pending-action highlight without touching any
+        /// Claude-authored HIGHLIGHT annotations in the same array.
+        ///
+        /// Previously clearPendingActionHighlight() removed all entries whose kind
+        /// is .highlight — which would incorrectly delete a Claude-authored HIGHLIGHT
+        /// that happened to coexist with a pending-action turn.
+        ///
+        /// Default is false — all annotations created by the resolution pipeline are
+        /// NOT pending-action highlights. Only publishPendingActionHighlight() sets
+        /// this to true (in CompanionManager+PendingAction.swift).
+        ///
+        /// clearDetectedElementLocation() also reads this field: if the array contains
+        /// a pending-action highlight it is preserved even on a non-walkthrough clear,
+        /// mirroring the walkthrough-phase preservation logic for step annotations.
+        let isPendingActionHighlight: Bool
     }
 
     /// Resolves a list of parsed annotations to their exact AppKit-global rects
@@ -2199,7 +2408,8 @@ final class CompanionManager: ObservableObject {
                     kind: parsedAnnotation.kind,
                     rectInAppKitGlobalCoordinates: elementAppKitRect,
                     displayFrameOfTargetScreen: targetScreenFrame,
-                    label: parsedAnnotation.label
+                    label: parsedAnnotation.label,
+                    isPendingActionHighlight: false // Claude-authored annotation, not a pending-action highlight
                 ))
 
             case .pixelRect(let screenshotPixelRect, let screenNumber):
@@ -2261,7 +2471,8 @@ final class CompanionManager: ObservableObject {
                     kind: parsedAnnotation.kind,
                     rectInAppKitGlobalCoordinates: appKitGlobalRect,
                     displayFrameOfTargetScreen: displayFrame,
-                    label: parsedAnnotation.label
+                    label: parsedAnnotation.label,
+                    isPendingActionHighlight: false // Claude-authored annotation, not a pending-action highlight
                 ))
             }
         }

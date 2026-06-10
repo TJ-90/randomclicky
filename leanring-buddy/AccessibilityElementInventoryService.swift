@@ -259,6 +259,13 @@ final class AccessibilityElementInventoryService: ObservableObject {
         let frontmostAppName = frontmostRunningApplication.localizedName ?? ""
         let frontmostAppBundleID = frontmostRunningApplication.bundleIdentifier ?? ""
 
+        // Snapshot the primary screen's AppKit frame HERE on the MainActor.
+        // NSScreen.screens is an AppKit property that must only be read on the
+        // main thread. We capture it as a plain CGRect value so the AX serial
+        // queue receives a value type with no actor requirement.
+        let primaryScreenFrameInAppKitCoordinates: CGRect = NSScreen.screens.first?.frame
+            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+
         // Check permission before scheduling AX work — avoids a queue dispatch
         // when we know upfront that the grant is absent.
         guard AXIsProcessTrusted() else {
@@ -291,13 +298,18 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 let inventory = self.performWalkOnAXThread(
                     processID: frontmostAppProcessID,
                     frontmostAppName: frontmostAppName,
-                    frontmostAppBundleID: frontmostAppBundleID
+                    frontmostAppBundleID: frontmostAppBundleID,
+                    primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
                 )
 
                 // Publish the completed result for the next turn's grounding,
                 // regardless of whether the current continuation is still alive.
-                DispatchQueue.main.async {
-                    self.mostRecentCompletedInventory = inventory
+                // Use Task+@MainActor rather than DispatchQueue.main.async so
+                // the write goes through Swift's actor isolation — the class is
+                // @MainActor and bypassing isolation via raw DispatchQueue hops
+                // is unsound even if it "works" in practice.
+                Task { @MainActor [weak self] in
+                    self?.mostRecentCompletedInventory = inventory
                 }
 
                 continuation.resume(returning: inventory)
@@ -488,13 +500,13 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 screenshotHeightInPixels: CGFloat(screenshotHeightInPixels)
             )
 
-            let x = Int(screenshotPixelRect.origin.x.rounded())
-            let y = Int(screenshotPixelRect.origin.y.rounded())
-            let w = Int(screenshotPixelRect.width.rounded())
-            let h = Int(screenshotPixelRect.height.rounded())
+            let screenshotPixelOriginX = Int(screenshotPixelRect.origin.x.rounded())
+            let screenshotPixelOriginY = Int(screenshotPixelRect.origin.y.rounded())
+            let screenshotPixelWidth = Int(screenshotPixelRect.width.rounded())
+            let screenshotPixelHeight = Int(screenshotPixelRect.height.rounded())
 
             // Format: [E12] AXButton "Submit" (812,440 96x28)
-            let line = "[E\(element.elementID)] \(element.role) \"\(element.title)\" (\(x),\(y) \(w)x\(h))"
+            let line = "[E\(element.elementID)] \(element.role) \"\(element.title)\" (\(screenshotPixelOriginX),\(screenshotPixelOriginY) \(screenshotPixelWidth)x\(screenshotPixelHeight))"
             lines.append(line)
         }
 
@@ -515,7 +527,8 @@ final class AccessibilityElementInventoryService: ObservableObject {
     private func performWalkOnAXThread(
         processID: pid_t,
         frontmostAppName: String,
-        frontmostAppBundleID: String
+        frontmostAppBundleID: String,
+        primaryScreenFrameInAppKitCoordinates: CGRect
     ) -> AccessibilityElementInventory {
 
         // Create the application-level AX element. A fresh element is created
@@ -552,7 +565,10 @@ final class AccessibilityElementInventoryService: ObservableObject {
         }
 
         // Read the window frame so we can use it for the visibility heuristic.
-        let windowCGFrame = getWindowCGFrame(windowElement: targetWindow)
+        // getWindowCGFrame returns nil when AX attribute reads fail or return
+        // unexpected CF types; treat nil as .zero (the existing "let all through"
+        // sentinel used by isElementFrameVisible and the effectiveWindowFrame guard).
+        let windowCGFrame = getWindowCGFrame(windowElement: targetWindow) ?? .zero
 
         // Build a list of all CG-space screen bounds for the visibility check.
         // We read this once here on the AX thread rather than consulting NSScreen
@@ -564,7 +580,8 @@ final class AccessibilityElementInventoryService: ObservableObject {
             windowElement: targetWindow,
             windowCGFrame: windowCGFrame,
             cgScreenBoundsForAllDisplays: cgScreenBoundsForAllDisplays,
-            processID: processID
+            processID: processID,
+            primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
         )
 
         // Electron/Chromium wake: if the walk yielded very few kept elements and
@@ -578,7 +595,8 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 windowElement: targetWindow,
                 windowCGFrame: windowCGFrame,
                 cgScreenBoundsForAllDisplays: cgScreenBoundsForAllDisplays,
-                processID: processID
+                processID: processID,
+                primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
             )
         }
 
@@ -616,7 +634,15 @@ final class AccessibilityElementInventoryService: ObservableObject {
             &windowValue
         )
         if focusedResult == .success, let window = windowValue {
-            return (window as! AXUIElement)
+            // AXUIElement is a CF type; `as?` cannot be used for conditional CF
+            // casts in Swift. Guard with CFGetTypeID to avoid a crash when a
+            // misbehaving app returns an unexpected type for this attribute.
+            guard CFGetTypeID(window) == AXUIElementGetTypeID() else {
+                // Unexpected type — fall through to the main-window fallback.
+                windowValue = nil
+                return nil
+            }
+            return unsafeBitCast(window, to: AXUIElement.self)
         }
 
         // Fall back to main window.
@@ -626,7 +652,10 @@ final class AccessibilityElementInventoryService: ObservableObject {
             &windowValue
         )
         if mainResult == .success, let window = windowValue {
-            return (window as! AXUIElement)
+            guard CFGetTypeID(window) == AXUIElementGetTypeID() else {
+                return nil
+            }
+            return unsafeBitCast(window, to: AXUIElement.self)
         }
 
         return nil
@@ -635,22 +664,38 @@ final class AccessibilityElementInventoryService: ObservableObject {
     // MARK: - Window frame
 
     /// Reads the window's CG-space frame from its AX position and size attributes.
-    /// Returns `.zero` on failure — callers treat a zero frame as "no intersection
+    /// Returns `nil` on failure — callers treat a nil/zero frame as "no intersection
     /// check possible" and let all elements through the visibility heuristic.
-    private func getWindowCGFrame(windowElement: AXUIElement) -> CGRect {
+    ///
+    /// AXValue is a CF type; `as?` cannot be used for a conditional CF cast in
+    /// Swift. We guard with `CFGetTypeID` to avoid a crash when a misbehaving app
+    /// returns an unexpected CF type for the position or size attribute.
+    private func getWindowCGFrame(windowElement: AXUIElement) -> CGRect? {
         var positionValue: AnyObject?
         var sizeValue: AnyObject?
 
         guard AXUIElementCopyAttributeValue(windowElement, kAXPositionAttribute as CFString, &positionValue) == .success,
               AXUIElementCopyAttributeValue(windowElement, kAXSizeAttribute as CFString, &sizeValue) == .success else {
-            return .zero
+            return nil
         }
+
+        // Guard CF type identity before casting — a misbehaving app could return
+        // a non-AXValue CF object for these attributes, which would crash a force-cast.
+        guard let positionCFValue = positionValue,
+              let sizeCFValue = sizeValue,
+              CFGetTypeID(positionCFValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeCFValue) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let positionAXValue = unsafeBitCast(positionCFValue, to: AXValue.self)
+        let sizeAXValue = unsafeBitCast(sizeCFValue, to: AXValue.self)
 
         var position = CGPoint.zero
         var size = CGSize.zero
-        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
-            return .zero
+        guard AXValueGetValue(positionAXValue, .cgPoint, &position),
+              AXValueGetValue(sizeAXValue, .cgSize, &size) else {
+            return nil
         }
 
         return CGRect(origin: position, size: size)
@@ -704,24 +749,13 @@ final class AccessibilityElementInventoryService: ObservableObject {
         windowElement: AXUIElement,
         windowCGFrame: CGRect,
         cgScreenBoundsForAllDisplays: [CGRect],
-        processID: pid_t
+        processID: pid_t,
+        primaryScreenFrameInAppKitCoordinates: CGRect
     ) -> WalkResult {
-
-        // Read the primary screen's AppKit frame once for the CG→AppKit conversion.
-        // NSScreen.screens[0] is the primary display by macOS convention; we pass
-        // this as a value so the pure ScreenCoordinateConverter functions stay
-        // free of NSScreen side effects. We can read NSScreen here because we are
-        // on a background thread that does not need MainActor — NSScreen property
-        // access is thread-safe (it reads from a cached array).
-        let primaryScreenFrameInAppKitCoordinates: CGRect
-        if let primaryScreen = NSScreen.screens.first {
-            primaryScreenFrameInAppKitCoordinates = primaryScreen.frame
-        } else {
-            // No display attached (headless / test environment). Use a sentinel
-            // that will produce reasonable (if incorrect) values so the walk
-            // does not crash.
-            primaryScreenFrameInAppKitCoordinates = CGRect(x: 0, y: 0, width: 1440, height: 900)
-        }
+        // primaryScreenFrameInAppKitCoordinates is snapshotted on the MainActor
+        // in captureInventoryOfFrontmostWindow() and passed down as a plain value
+        // type. NSScreen.screens must NOT be read here — this function runs on the
+        // AX serial background queue, and NSScreen is a main-thread AppKit property.
 
         // BFS queue entries: (element, depth).
         var bfsQueue: [(element: AXUIElement, depth: Int)] = [(windowElement, 0)]
@@ -949,41 +983,61 @@ final class AccessibilityElementInventoryService: ObservableObject {
         windowElement: AXUIElement,
         windowCGFrame: CGRect,
         cgScreenBoundsForAllDisplays: [CGRect],
-        processID: pid_t
+        processID: pid_t,
+        primaryScreenFrameInAppKitCoordinates: CGRect
     ) -> WalkResult {
+
+        // Apply the messaging timeout on the app element BEFORE entering the
+        // wake/retry loop. A hung Chromium process could otherwise stall every
+        // AX call inside the loop for the OS default (~6s per call). The timeout
+        // was already set in performWalkOnAXThread on the same appElement, but
+        // we re-apply it here so this function is self-contained and safe to
+        // call from any path that skips performWalkOnAXThread's preamble.
+        AXUIElementSetMessagingTimeout(appElement, AccessibilityElementInventoryService.axMessagingTimeoutInSeconds)
 
         // --- Read current attribute values for restoration ---
         var originalManualValue: AnyObject?
-        let hadManualAttribute = AXUIElementCopyAttributeValue(
+        let hadManualAttributeBeforeWake = AXUIElementCopyAttributeValue(
             appElement,
             "AXManualAccessibility" as CFString,
             &originalManualValue
         ) == .success
 
         var originalEnhancedValue: AnyObject?
-        let hadEnhancedAttribute = AXUIElementCopyAttributeValue(
+        let hadEnhancedAttributeBeforeWake = AXUIElementCopyAttributeValue(
             appElement,
             "AXEnhancedUserInterface" as CFString,
             &originalEnhancedValue
         ) == .success
 
+        // Track which attributes this function actually writes so the defer
+        // restores ONLY those — we must not touch attributes we never set.
+        var didSetManualAccessibility = false
+        var didSetEnhancedUserInterface = false
+
         defer {
-            // Restoration runs unconditionally when this function returns so
-            // window managers always see the original values restored.
-            if hadManualAttribute {
-                let valueToRestore = originalManualValue ?? (false as CFBoolean)
-                AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, valueToRestore)
-            } else {
-                // If the attribute wasn't present before, set it to false to
-                // undo any value we may have set.
-                AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, false as CFBoolean)
+            // Restore only the attributes that this function actually SET.
+            // Unconditionally writing attributes we never touched can have
+            // unintended side effects on the target app (e.g. disabling
+            // AXEnhancedUserInterface on a window manager that set it).
+            if didSetManualAccessibility {
+                if hadManualAttributeBeforeWake {
+                    let valueToRestore = originalManualValue ?? (false as CFBoolean)
+                    AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, valueToRestore)
+                } else {
+                    // Attribute did not exist before; clear the value we wrote.
+                    AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, false as CFBoolean)
+                }
             }
 
-            if hadEnhancedAttribute {
-                let valueToRestore = originalEnhancedValue ?? (false as CFBoolean)
-                AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, valueToRestore)
-            } else {
-                AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, false as CFBoolean)
+            if didSetEnhancedUserInterface {
+                if hadEnhancedAttributeBeforeWake {
+                    let valueToRestore = originalEnhancedValue ?? (false as CFBoolean)
+                    AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, valueToRestore)
+                } else {
+                    // Attribute did not exist before; clear the value we wrote.
+                    AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, false as CFBoolean)
+                }
             }
         }
 
@@ -992,19 +1046,21 @@ final class AccessibilityElementInventoryService: ObservableObject {
         for retryIndex in 0..<AccessibilityElementInventoryService.maximumElectronWakeRetryCount {
             // Attempt 0: AXManualAccessibility (preferred, fewer side effects).
             // Attempt 1: AXEnhancedUserInterface (broader compatibility, more side
-            //             effects — restored in defer above).
+            //             effects — restored in defer above only if we set it).
             if retryIndex == 0 {
                 AXUIElementSetAttributeValue(
                     appElement,
                     "AXManualAccessibility" as CFString,
                     true as CFBoolean
                 )
+                didSetManualAccessibility = true
             } else {
                 AXUIElementSetAttributeValue(
                     appElement,
                     "AXEnhancedUserInterface" as CFString,
                     true as CFBoolean
                 )
+                didSetEnhancedUserInterface = true
             }
 
             // Sleep on the AX thread to let the Chromium renderer populate its
@@ -1017,7 +1073,8 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 windowElement: windowElement,
                 windowCGFrame: windowCGFrame,
                 cgScreenBoundsForAllDisplays: cgScreenBoundsForAllDisplays,
-                processID: processID
+                processID: processID,
+                primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
             )
 
             if result.keptElements.count > bestResult.keptElements.count {

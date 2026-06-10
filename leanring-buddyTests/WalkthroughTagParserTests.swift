@@ -343,4 +343,36 @@ struct WalkthroughTagParserTests {
         #expect(WalkthroughTagParser.transcriptMatchesDoneSignal("  done  ") == true)
         #expect(WalkthroughTagParser.transcriptMatchesDoneSignal("\tdone\n") == true)
     }
+
+    // MARK: - All tag occurrences stripped (not just the first)
+
+    /// A response containing two [STEP:...] tags and one [WALKTHROUGH:...] tag
+    /// must have ALL of them stripped from spokenText. The parsed result is the
+    /// first STEP tag; the second STEP tag is silently dropped (only one step
+    /// can be active per response). The WALKTHROUGH tag is also stripped entirely.
+    ///
+    /// This guards against a regression where only the first match was removed
+    /// and subsequent occurrences survived into the spoken text.
+    @Test func multipleStepAndWalkthroughTagsAreAllStrippedFromSpokenText() {
+        // Two STEP tags and one WALKTHROUGH tag — all three must be stripped.
+        let response = "okay [WALKTHROUGH:3] first do this [STEP:1:Open Safari] then do that [STEP:2:Click the address bar] and you are ready"
+
+        let (declaration, step, strippedText) = WalkthroughTagParser.parseWalkthroughTags(from: response)
+
+        // Declaration is parsed from the WALKTHROUGH tag.
+        #expect(declaration?.totalStepCount == 3)
+
+        // The first STEP tag is the parsed result.
+        #expect(step?.stepNumber == 1)
+        #expect(step?.instruction == "Open Safari")
+
+        // ALL tag occurrences must be absent from the spoken text.
+        #expect(!strippedText.contains("[WALKTHROUGH:"), "WALKTHROUGH tag must be stripped")
+        #expect(!strippedText.contains("[STEP:"), "Both STEP tags must be stripped")
+
+        // The surrounding natural-language text must survive stripping.
+        #expect(strippedText.contains("first do this"))
+        #expect(strippedText.contains("then do that"))
+        #expect(strippedText.contains("and you are ready"))
+    }
 }

@@ -266,10 +266,18 @@ final class WalkthroughController: ObservableObject {
             guard snapshot.phase != .inactive else {
                 return (snapshot, .none)
             }
-            return (
-                snapshot.withPhase(.inactive),
-                .announceCancellation
+            // FIX 6: produce a fully-reset snapshot on cancel so the inactive
+            // state never holds stale declaredSteps or indices from the old walk.
+            // withPhase() preserves those fields; constructing a fresh snapshot
+            // avoids any code that reads the snapshot while .inactive seeing stale data.
+            let resetSnapshot = WalkthroughStateSnapshot(
+                phase: .inactive,
+                declaredSteps: [],
+                currentStepIndex: 0,
+                retryCountForCurrentStep: 0,
+                totalStepCount: 0
             )
+            return (resetSnapshot, .announceCancellation)
         }
 
         switch snapshot.phase {
@@ -278,13 +286,17 @@ final class WalkthroughController: ObservableObject {
         case .inactive:
             switch event {
             case .walkthroughDeclared(let totalStepCount):
-                // A walkthrough tag was parsed. Record the declared total and
-                // move to presentingStep so the manager can present step 1.
+                // A walkthrough tag was parsed. Start a completely fresh snapshot
+                // so a second walkthrough never inherits declaredSteps, currentStepIndex,
+                // or retryCountForCurrentStep from a previous session.
+                // FIX 6: previously this preserved snapshot.declaredSteps from the old
+                // walkthrough, causing the step chip and verification prompts to show
+                // stale steps from the prior session.
                 let newSnapshot = WalkthroughStateSnapshot(
                     phase: .presentingStep,
-                    declaredSteps: snapshot.declaredSteps,
-                    currentStepIndex: 0,
-                    retryCountForCurrentStep: 0,
+                    declaredSteps: [],          // FIX 6: always start with an empty step list
+                    currentStepIndex: 0,        // FIX 6: always reset to step 0
+                    retryCountForCurrentStep: 0, // FIX 6: always reset retry count
                     totalStepCount: totalStepCount
                 )
                 return (newSnapshot, .none)
@@ -310,6 +322,14 @@ final class WalkthroughController: ObservableObject {
                     totalStepCount: snapshot.totalStepCount
                 )
                 return (newSnapshot, .none)
+
+            case .turnInterrupted:
+                // FIX 8: a PTT press during .presentingStep cancels the TTS task
+                // and leaves the controller stuck here with no active turn. Move to
+                // .awaitingUserAction so the user can signal step completion or ask
+                // for help. The step was at least partially spoken — awaiting is the
+                // safe state. Retry count is preserved (withPhase keeps all other fields).
+                return (snapshot.withPhase(.awaitingUserAction), .none)
 
             case .userCancelled:
                 // Already handled above — unreachable but exhaustiveness requires it.
@@ -357,8 +377,17 @@ final class WalkthroughController: ObservableObject {
                 let isLastStep = snapshot.currentStepIndex >= snapshot.totalStepCount - 1
 
                 if isLastStep {
-                    // Walkthrough complete — reset to inactive.
-                    return (snapshot.withPhase(.inactive), .announceCompletion)
+                    // Walkthrough complete — reset to inactive with a clean snapshot.
+                    // FIX 6: use a fully-reset snapshot (not withPhase) so the inactive
+                    // state never holds stale declaredSteps or indices from the finished walk.
+                    let completionResetSnapshot = WalkthroughStateSnapshot(
+                        phase: .inactive,
+                        declaredSteps: [],
+                        currentStepIndex: 0,
+                        retryCountForCurrentStep: 0,
+                        totalStepCount: 0
+                    )
+                    return (completionResetSnapshot, .announceCompletion)
                 } else {
                     // Advance to the next step. Reset retry count for the new step.
                     let advancedSnapshot = WalkthroughStateSnapshot(

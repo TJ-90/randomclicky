@@ -129,20 +129,31 @@ enum WalkthroughTagParser {
         var parsedStep: ParsedWalkthroughStep? = nil
 
         // --- Parse [WALKTHROUGH:<total>] ---
+        // FIX 7: Strip ALL occurrences, not just the first. Previously, extra
+        // [WALKTHROUGH:] tags in a response were left in the text, spoken aloud by
+        // TTS and broken the end-anchored POINT parser (which matches at the true end).
+        // We keep only the FIRST parsed declaration as the semantic result; all
+        // occurrences are stripped from the spoken text. Removal is done in reverse
+        // order (largest range first) — the same safe-mutation approach as
+        // AnnotationTagParser — so earlier range indices remain valid after each removal.
+        //
         // Matches [WALKTHROUGH:] followed by one or more digits and a closing bracket.
-        // There should be at most one declaration per response; we take the first match.
         let declarationPattern = #"\[WALKTHROUGH:(\d+)\]"#
         if let declarationRegex = try? NSRegularExpression(pattern: declarationPattern, options: []) {
             let fullRange = NSRange(workingText.startIndex..., in: workingText)
-            if let match = declarationRegex.firstMatch(in: workingText, range: fullRange) {
-                // Extract the total step count from capture group 1.
-                if let digitRange = Range(match.range(at: 1), in: workingText),
+            let allDeclarationMatches = declarationRegex.matches(in: workingText, range: fullRange)
+
+            // Semantic result: parse only the FIRST occurrence.
+            if let firstMatch = allDeclarationMatches.first {
+                if let digitRange = Range(firstMatch.range(at: 1), in: workingText),
                    let totalStepCount = Int(workingText[digitRange]),
                    totalStepCount > 0 {
                     parsedDeclaration = ParsedWalkthroughDeclaration(totalStepCount: totalStepCount)
                 }
-                // Strip the declaration tag from the text regardless of whether
-                // the digit parse succeeded — a malformed tag must not be spoken.
+            }
+
+            // Strip ALL occurrences in reverse order so earlier indices stay valid.
+            for match in allDeclarationMatches.reversed() {
                 if let tagRange = Range(match.range, in: workingText) {
                     workingText.replaceSubrange(tagRange, with: "")
                 }
@@ -150,6 +161,10 @@ enum WalkthroughTagParser {
         }
 
         // --- Parse [STEP:<n>:<instruction>] ---
+        // FIX 7: Strip ALL occurrences. Extra [STEP:] tags in a response (e.g. Claude
+        // emitting two steps in one turn) were previously left in the text and spoken
+        // by TTS. Keep only the FIRST parsed step as the semantic result; remove all.
+        //
         // The instruction is greedy: [STEP:<digits>:<everything up to ]>]
         // We capture the digit group and the rest-of-body separately so the
         // instruction can contain colons without splitting incorrectly.
@@ -164,10 +179,12 @@ enum WalkthroughTagParser {
         if let stepRegex = try? NSRegularExpression(pattern: stepPattern, options: []) {
             // Re-calculate range after potential declaration removal above.
             let fullRange = NSRange(workingText.startIndex..., in: workingText)
-            if let match = stepRegex.firstMatch(in: workingText, range: fullRange) {
-                // Extract step number (group 1) and instruction (group 2).
-                if let numberRange = Range(match.range(at: 1), in: workingText),
-                   let instructionRange = Range(match.range(at: 2), in: workingText),
+            let allStepMatches = stepRegex.matches(in: workingText, range: fullRange)
+
+            // Semantic result: parse only the FIRST occurrence.
+            if let firstMatch = allStepMatches.first {
+                if let numberRange = Range(firstMatch.range(at: 1), in: workingText),
+                   let instructionRange = Range(firstMatch.range(at: 2), in: workingText),
                    let stepNumber = Int(workingText[numberRange]) {
                     let instruction = String(workingText[instructionRange])
                         .trimmingCharacters(in: .whitespaces)
@@ -178,7 +195,28 @@ enum WalkthroughTagParser {
                         )
                     }
                 }
-                // Strip the step tag whether or not parsing succeeded.
+            }
+
+            // Strip ALL occurrences in reverse order so earlier indices stay valid.
+            for match in allStepMatches.reversed() {
+                if let tagRange = Range(match.range, in: workingText) {
+                    workingText.replaceSubrange(tagRange, with: "")
+                }
+            }
+        }
+
+        // --- Strip all [VERIFY:...] tags from the spoken text ---
+        // FIX 7: [VERIFY:] tags that appear in a response parsed by parseWalkthroughTags
+        // (rather than parseVerificationVerdict) would otherwise be left in the text
+        // and spoken aloud. Strip them all here so TTS never hears them and the POINT
+        // end-anchor still fires correctly. We do NOT parse a semantic result here —
+        // the verification verdict is only consumed by parseVerificationVerdict, which
+        // is called on a different text path (the verification-turn response).
+        let verifyPattern = #"\[VERIFY:[^\]]*\]"#
+        if let verifyRegex = try? NSRegularExpression(pattern: verifyPattern, options: []) {
+            let fullRange = NSRange(workingText.startIndex..., in: workingText)
+            let allVerifyMatches = verifyRegex.matches(in: workingText, range: fullRange)
+            for match in allVerifyMatches.reversed() {
                 if let tagRange = Range(match.range, in: workingText) {
                     workingText.replaceSubrange(tagRange, with: "")
                 }
