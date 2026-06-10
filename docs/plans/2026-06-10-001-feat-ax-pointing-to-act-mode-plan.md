@@ -1,7 +1,7 @@
 ---
 title: "feat: AX-grounded pointing, annotations, guided walkthroughs, and act mode"
 type: feat
-status: active
+status: completed
 date: 2026-06-10
 deepened: 2026-06-10
 ---
