@@ -15,6 +15,26 @@ import Foundation
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
 
+    /// Publishes a `Void` event whenever the Esc key (keyCode 53) is observed
+    /// by the CGEvent tap. This is the act-mode kill-switch channel.
+    ///
+    /// WHY A SEPARATE PUBLISHER, NOT PART OF shortcutTransitionPublisher
+    /// ─────────────────────────────────────────────────────────────────────────
+    /// `shortcutTransitionPublisher` carries push-to-talk transitions (press /
+    /// release of ctrl+option). Esc is a completely different semantic — it is
+    /// an abort signal for pending act-mode actions — so a separate publisher
+    /// keeps the two channels decoupled. Callers that don't care about act-mode
+    /// abort (e.g. the TTS pipeline) don't need to filter a combined stream.
+    ///
+    /// LISTEN-ONLY TAP IS SUFFICIENT FOR ABORT
+    /// ─────────────────────────────────────────────────────────────────────────
+    /// The tap cannot swallow the Esc event. Esc may therefore also reach the
+    /// target app (e.g. dismissing a dialog in the frontmost window). This is
+    /// an accepted, documented side-effect: the user's intent is clearly "stop
+    /// everything", and Esc reaching the target app is typically harmless (it
+    /// dismisses dialogs, deselects text, etc.) or beneficial.
+    let escKeyObservedPublisher = PassthroughSubject<Void, Never>()
+
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
     /// Mutated exclusively from the CGEvent tap callback, which runs on
@@ -122,6 +142,18 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         }
 
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+
+        // Esc kill-switch observation for act-mode abort.
+        // keyCode 53 = Escape on all standard Apple keyboards (US and international).
+        // We only publish on keyDown to fire exactly once per press — flagsChanged
+        // and keyUp for Esc are not meaningful for the abort semantic.
+        // The tap is listen-only so the Esc may also reach the frontmost app — this
+        // is acceptable and documented in escKeyObservedPublisher's comment above.
+        let escapeKeyCode: UInt16 = 53
+        if eventType == .keyDown && eventKeyCode == escapeKeyCode {
+            escKeyObservedPublisher.send()
+        }
+
         let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
             for: eventType,
             keyCode: eventKeyCode,

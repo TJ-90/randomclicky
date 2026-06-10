@@ -76,7 +76,11 @@ final class CompanionManager: ObservableObject {
     /// `sendTranscriptToClaudeWithScreenshot`; cleared inside
     /// `clearDetectedElementLocation()` so both halves of the overlay state
     /// (pointing cursor + annotation shapes) are always cleared together.
-    @Published private(set) var resolvedScreenAnnotations: [ResolvedScreenAnnotation] = []
+    // internal(set) — not private(set) — so CompanionManager+PendingAction.swift
+    // (a separate file extension in the same module) can append/remove highlight
+    // annotations without having to funnel every mutation through a helper on the
+    // class itself. All writes still happen on @MainActor.
+    @Published var resolvedScreenAnnotations: [ResolvedScreenAnnotation] = []
 
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
@@ -254,9 +258,26 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+
+        // Phase D (act mode, U11): subscribe to the Esc and PTT kill-switch channels
+        // so pending actions are aborted on either signal. Must be called after
+        // bindShortcutTransitions() so both subscriptions to shortcutTransitionPublisher
+        // are live. The two subscriptions are independent and do not interfere.
+        bindActModeKillSwitchObservation()
+
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
+
+        // Phase D (act mode, U11): confirmation-panel key-acquisition spike.
+        // Only runs when `--confirmation-panel-spike` is in the launch arguments.
+        // See ActionConfirmationPanel.swift for full spike instructions.
+        // Compiled only in DEBUG builds (the spike body is #if DEBUG guarded there).
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--confirmation-panel-spike") {
+            ActionConfirmationPanel.runKeyAcquisitionSpike()
+        }
+        #endif
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -1033,10 +1054,30 @@ final class CompanionManager: ObservableObject {
                     print("🖼️ Annotations resolved: \(resolvedScreenAnnotations.count) shapes ready for overlay")
                 }
 
+                // --- Action tag parsing (Phase D, U11) ---
+                // Run AFTER annotation and walkthrough tags have been stripped, and BEFORE
+                // the POINT parser so the parse-order contract is maintained: POINT sees
+                // a clean tail free of all inline tags (CLICK/TYPE appear anywhere in the
+                // response body, not end-anchored, so they must be stripped before POINT).
+                //
+                // processActionTagsAndEnqueue (defined in CompanionManager+PendingAction.swift):
+                //   1. Parses CLICK/TYPE tags from responseTextAfterWalkthroughStripping.
+                //   2. Applies the act-mode gate — drops all if act mode is off.
+                //   3. Resolves element IDs against inventoryForCurrentInteraction.
+                //   4. Enqueues resolved actions so the confirmation panel appears.
+                //   5. Returns the text with CLICK/TYPE tags removed (and optionally a
+                //      "act mode is off" notice prefix when actions were dropped).
+                //
+                // The returned text flows into POINT parsing, TTS, and conversation
+                // history — CLICK/TYPE tags are never spoken aloud or stored.
+                let responseTextAfterActionTagStripping = processActionTagsAndEnqueue(
+                    textAfterWalkthroughStripping: responseTextAfterWalkthroughStripping
+                )
+
                 // Parse the [POINT:...] tag from the fully-stripped response text
-                // (annotation tags and walkthrough tags both removed). The end-anchor
+                // (annotation + walkthrough + action tags all removed). The end-anchor
                 // regex reliably finds [POINT:...] at the actual end of the text.
-                let parseResult = Self.parsePointingCoordinates(from: responseTextAfterWalkthroughStripping)
+                let parseResult = Self.parsePointingCoordinates(from: responseTextAfterActionTagStripping)
                 let spokenText = parseResult.spokenText
 
                 // Resolve the pointing instruction to an on-screen location.
