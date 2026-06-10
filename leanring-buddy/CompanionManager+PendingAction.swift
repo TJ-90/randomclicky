@@ -307,6 +307,18 @@ extension CompanionManager {
         }
         pendingActionStorage.resolvedElementQueue!.append(resolvedElement)
 
+        // Analytics: action proposed. The target app bundle ID identifies which app
+        // is being acted upon (e.g. "com.apple.Safari") — this is not user content.
+        // IMPORTANT: the TYPE text payload must NEVER appear in any analytics call.
+        // We only log the action kind ("click" or "type") and the bundle ID.
+        ClickyAnalytics.trackActionProposed(
+            actionKind: action.kind == .click ? "click" : "type",
+            targetAppBundleID: resolvedElement.owningProcessID > 0
+                ? (NSRunningApplication(processIdentifier: resolvedElement.owningProcessID)?
+                    .bundleIdentifier ?? "unknown")
+                : "unknown"
+        )
+
         // If no confirmation panel is showing, show the head of the queue now.
         if pendingActionStorage.currentConfirmationPanelController == nil {
             presentNextPendingActionIfNeeded()
@@ -382,6 +394,14 @@ extension CompanionManager {
 
         case .cancelledByUser:
             // Explicit cancel: clear queue, remove highlight, speak brief acknowledgment.
+            // Analytics: action cancelled. No text content in payload.
+            let cancelledBundleID = (pendingActionStorage.resolvedElementQueue?.first)
+                .flatMap { NSRunningApplication(processIdentifier: $0.owningProcessID)?.bundleIdentifier }
+                ?? "unknown"
+            ClickyAnalytics.trackActionCancelled(
+                actionKind: executedAction.kind == .click ? "click" : "type",
+                targetAppBundleID: cancelledBundleID
+            )
             pendingActionStorage.pendingActionQueue = PendingActionStateMachine.cancelAllPendingActions(
                 queue: pendingActionStorage.pendingActionQueue
             )
@@ -407,6 +427,16 @@ extension CompanionManager {
     /// Executes a confirmed action via ActionExecutionService and advances the queue.
     private func handleActionConfirmed(action: ParsedElementAction, targetElement: AccessibleElement) {
         print("🎬 Act mode: executing confirmed action E\(action.elementID) — \"\(action.claudeDescription)\"")
+
+        // Analytics: action confirmed. No text content in payload — see privacy
+        // note on trackActionProposed. Bundle ID identifies the target app only.
+        let confirmedBundleID = NSRunningApplication(
+            processIdentifier: targetElement.owningProcessID
+        )?.bundleIdentifier ?? "unknown"
+        ClickyAnalytics.trackActionConfirmed(
+            actionKind: action.kind == .click ? "click" : "type",
+            targetAppBundleID: confirmedBundleID
+        )
 
         // Advance the queue first. If execution fails the queue is already clean
         // and the user is not left with a stale pending-action state.
@@ -434,6 +464,16 @@ extension CompanionManager {
             let textToType = action.textToType ?? ""
             plannedAction = .type(target: targetElement, textToType: textToType)
         }
+
+        // Resolve analytics values before entering the Task so they are stable
+        // even if the target app exits mid-flight. PRIVACY: bundle ID only —
+        // no user content, no TYPE text payload. The TYPE text must never leave
+        // this device via any analytics call; it stays between the user and the
+        // target app.
+        let targetAppBundleIDForAnalytics = NSRunningApplication(
+            processIdentifier: targetElement.owningProcessID
+        )?.bundleIdentifier ?? "unknown"
+        let actionKindStringForAnalytics = action.kind == .click ? "click" : "type"
 
         // Execute on the service (async, runs the AX safety chain).
         Task {
@@ -463,13 +503,49 @@ extension CompanionManager {
                     presentNextPendingActionIfNeeded()
                 }
 
-            case .failed, .refused, .staleTarget, .aborted:
-                // Clear the remaining queue on any failure — don't attempt
-                // subsequent actions after an unknown-state failure.
+            case .failed(let reason):
+                // Analytics: action failed with a machine-readable reason string.
+                // `reason` comes from ActionExecutionService — it is an internal
+                // description, never user-typed content.
+                ClickyAnalytics.trackActionFailed(
+                    actionKind: actionKindStringForAnalytics,
+                    targetAppBundleID: targetAppBundleIDForAnalytics,
+                    failureReason: "failed:\(reason)"
+                )
                 pendingActionStorage.pendingActionQueue = []
                 pendingActionStorage.resolvedElementQueue = []
                 clearPendingActionHighlight()
-                print("🔒 Act mode: queue cleared after failed/refused/stale/aborted result")
+                print("🔒 Act mode: queue cleared after failed result (\(reason))")
+
+            case .refused(let reason):
+                ClickyAnalytics.trackActionFailed(
+                    actionKind: actionKindStringForAnalytics,
+                    targetAppBundleID: targetAppBundleIDForAnalytics,
+                    failureReason: "refused:\(reason)"
+                )
+                pendingActionStorage.pendingActionQueue = []
+                pendingActionStorage.resolvedElementQueue = []
+                clearPendingActionHighlight()
+                print("🔒 Act mode: queue cleared after refused result (\(reason))")
+
+            case .staleTarget:
+                ClickyAnalytics.trackActionFailed(
+                    actionKind: actionKindStringForAnalytics,
+                    targetAppBundleID: targetAppBundleIDForAnalytics,
+                    failureReason: "staleTarget"
+                )
+                pendingActionStorage.pendingActionQueue = []
+                pendingActionStorage.resolvedElementQueue = []
+                clearPendingActionHighlight()
+                print("🔒 Act mode: queue cleared after staleTarget result")
+
+            case .aborted:
+                // Abort is user-initiated (kill switch fired). The kill switch
+                // handler has already cleared state; this case is a safety net.
+                pendingActionStorage.pendingActionQueue = []
+                pendingActionStorage.resolvedElementQueue = []
+                clearPendingActionHighlight()
+                print("🔒 Act mode: queue cleared after aborted result")
             }
         }
     }

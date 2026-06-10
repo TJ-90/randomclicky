@@ -16,6 +16,32 @@ enum PermissionRequestPresentationDestination: Equatable {
     case systemSettings
 }
 
+// MARK: - Accessibility health state (U12 stale-TCC self-check)
+
+/// Describes the health of the Accessibility (TCC) grant from the perspective
+/// of Clicky's runtime.
+///
+/// macOS sometimes leaves `AXIsProcessTrusted()` returning `true` even though
+/// the grant is effectively stale — this happens after re-signing a dev build or
+/// after a macOS update that invalidates the cached grant. In that state, all AX
+/// API calls fail silently or return `kAXErrorAPIDisabled`. The `.staleGrantNeedsReToggle`
+/// case catches exactly this situation so the panel can surface a "re-toggle
+/// Accessibility" hint instead of failing silently.
+enum AccessibilityHealthState: Equatable {
+    /// `AXIsProcessTrusted()` is true AND a trivial AX read succeeded.
+    /// Normal operation — no action needed.
+    case healthy
+
+    /// `AXIsProcessTrusted()` is true BUT a trivial AX read failed.
+    /// The TCC entry is stale (common after re-signing dev builds or macOS updates).
+    /// User must toggle the grant off and back on in System Settings.
+    case staleGrantNeedsReToggle
+
+    /// `AXIsProcessTrusted()` is false. The grant was never given or was revoked.
+    /// Show the normal "Grant" accessibility permission row.
+    case notGranted
+}
+
 @MainActor
 class WindowPositionManager {
     private static var hasAttemptedAccessibilitySystemPromptDuringCurrentLaunch = false
@@ -148,6 +174,50 @@ class WindowPositionManager {
         }
 
         return .systemPrompt
+    }
+
+    // MARK: - Stale-TCC self-check (U12)
+
+    /// Pure decision function for the Accessibility health self-check.
+    ///
+    /// This is the U12 stale-TCC check described in the plan's KTD
+    /// "Permissions: reuse, but self-check". It is a pure static function so it
+    /// is directly unit-testable without any live AX calls.
+    ///
+    /// The three outcomes map directly to the panel's UI response:
+    /// - `.healthy`                → show "Granted" badge as normal
+    /// - `.staleGrantNeedsReToggle` → show a re-toggle hint row instead of the
+    ///   normal "Granted" badge — the user must toggle the grant off/on in
+    ///   System Settings → Privacy & Security → Accessibility
+    /// - `.notGranted`             → show the existing "Grant" button row
+    ///
+    /// - Parameters:
+    ///   - isProcessTrusted: The result of `AXIsProcessTrusted()` at call time.
+    ///   - trivialAXReadSucceeded: Whether a cheap one-attribute AX read against
+    ///     the frontmost application returned a non-error result. Obtained by
+    ///     `CompanionManager.performAccessibilityHealthSelfCheck()` on the shared
+    ///     AX serial queue. Pass `false` when the read returned any
+    ///     `kAXError*` code, true when it returned `.success` or any data value.
+    /// - Returns: The `AccessibilityHealthState` the panel should reflect.
+    static func accessibilityHealthState(
+        isProcessTrusted: Bool,
+        trivialAXReadSucceeded: Bool
+    ) -> AccessibilityHealthState {
+        // If the OS does not consider the process trusted at all, the grant is
+        // simply absent — show the normal request flow.
+        guard isProcessTrusted else {
+            return .notGranted
+        }
+
+        // Trusted + read succeeded → everything is working normally.
+        if trivialAXReadSucceeded {
+            return .healthy
+        }
+
+        // Trusted + read FAILED → stale grant. The TCC entry exists but the AX
+        // subsystem won't service calls. The user needs to toggle the grant off
+        // and on in System Settings to refresh the permission.
+        return .staleGrantNeedsReToggle
     }
 
     // MARK: - Window Positioning

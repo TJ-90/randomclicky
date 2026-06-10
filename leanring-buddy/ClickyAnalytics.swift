@@ -201,6 +201,105 @@ enum ClickyAnalytics {
         ])
     }
 
+    // MARK: - Act Mode (U12)
+
+    /// The user enabled act mode from the panel toggle.
+    static func trackActModeEnabled() {
+        PostHogSDK.shared.capture("act_mode_enabled")
+    }
+
+    /// The user disabled act mode from the panel toggle.
+    static func trackActModeDisabled() {
+        PostHogSDK.shared.capture("act_mode_disabled")
+    }
+
+    // MARK: - Act Mode Action Lifecycle (U11/U12)
+
+    /// Claude proposed an action (CLICK or TYPE tag was parsed and enqueued).
+    ///
+    /// PRIVACY AUDIT: `targetAppBundleID` (e.g. "com.apple.Safari") is safe to
+    /// send — it is the app identifier, not any user content. The `actionKind`
+    /// is "click" or "type" — no typed text. No text content from TYPE payloads
+    /// ever appears in any analytics payload; text-to-type is a device-local
+    /// secret between the user and the target app.
+    static func trackActionProposed(actionKind: String, targetAppBundleID: String) {
+        PostHogSDK.shared.capture("act_mode_action_proposed", properties:
+            buildActionEventProperties(
+                actionKind: actionKind,
+                targetAppBundleID: targetAppBundleID
+            )
+        )
+    }
+
+    /// The user confirmed an action (pressed Return on the confirmation panel).
+    ///
+    /// No text content included — see privacy note on `trackActionProposed`.
+    static func trackActionConfirmed(actionKind: String, targetAppBundleID: String) {
+        PostHogSDK.shared.capture("act_mode_action_confirmed", properties:
+            buildActionEventProperties(
+                actionKind: actionKind,
+                targetAppBundleID: targetAppBundleID
+            )
+        )
+    }
+
+    /// The user cancelled an action (pressed Esc, PTT, or the cancel button).
+    ///
+    /// No text content included — see privacy note on `trackActionProposed`.
+    static func trackActionCancelled(actionKind: String, targetAppBundleID: String) {
+        PostHogSDK.shared.capture("act_mode_action_cancelled", properties:
+            buildActionEventProperties(
+                actionKind: actionKind,
+                targetAppBundleID: targetAppBundleID
+            )
+        )
+    }
+
+    /// An action failed to execute (stale target, refused, or execution error).
+    ///
+    /// `failureReason` is a short machine-readable tag (e.g. "staleTarget",
+    /// "refused_secure_field") — never user-entered text.
+    /// No text content included — see privacy note on `trackActionProposed`.
+    static func trackActionFailed(
+        actionKind: String,
+        targetAppBundleID: String,
+        failureReason: String
+    ) {
+        var properties = buildActionEventProperties(
+            actionKind: actionKind,
+            targetAppBundleID: targetAppBundleID
+        )
+        properties["failure_reason"] = failureReason
+        PostHogSDK.shared.capture("act_mode_action_failed", properties: properties)
+    }
+
+    // MARK: - Pure payload builder (testable)
+
+    /// Builds the base properties dictionary for act-mode action analytics events.
+    ///
+    /// Extracted as a pure static function so tests can verify that no user
+    /// content (e.g. TYPE text payloads) ever appears in the output. Call sites
+    /// pass exactly `actionKind` ("click" or "type") and `targetAppBundleID`
+    /// — nothing else.
+    ///
+    /// PRIVACY INVARIANT (enforced by this function's signature):
+    ///   The function accepts only `actionKind` and `targetAppBundleID`.
+    ///   There is no `textToType` parameter. Any caller that tries to pass
+    ///   typed text here will fail to compile. This is the primary compile-time
+    ///   guarantee that TYPE payloads never reach the analytics backend.
+    static func buildActionEventProperties(
+        actionKind: String,
+        targetAppBundleID: String
+    ) -> [String: Any] {
+        return [
+            "action_kind": actionKind,
+            "target_app_bundle_id": targetAppBundleID
+            // INTENTIONALLY NO "text_to_type" KEY HERE.
+            // TYPE payloads must never leave this device via analytics.
+            // If you add a typed-text field here, you violate the privacy contract.
+        ]
+    }
+
     // MARK: - Errors
 
     /// An error occurred during the AI response pipeline.

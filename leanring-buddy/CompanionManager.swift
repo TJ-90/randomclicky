@@ -31,6 +31,48 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
 
+    // MARK: - Act-mode published state (U12)
+
+    /// Whether act mode is currently enabled. Mirrors the UserDefaults flag
+    /// defined in CompanionManager+PendingAction.swift so SwiftUI views can
+    /// bind a Toggle to it and receive change notifications.
+    ///
+    /// The UserDefaults key (`actModeEnabled`) is defined in
+    /// CompanionManager+PendingAction.swift as `actModeEnabledUserDefaultsKey`.
+    /// This @Published wrapper is the UI-facing source-of-truth; write through
+    /// `setActModeEnabled(_:)` so both the @Published value and UserDefaults stay
+    /// in sync. Do NOT write UserDefaults directly from the toggle binding —
+    /// that would create a second source of truth.
+    @Published var isActModeEnabledPublished: Bool = UserDefaults.standard.bool(forKey: "actModeEnabled")
+
+    /// Sets act mode on or off and persists the choice to UserDefaults.
+    ///
+    /// Called by the toggle binding in CompanionPanelView. Also fires the
+    /// actModeEnabled/actModeDisabled analytics events.
+    func setActModeEnabled(_ enabled: Bool) {
+        isActModeEnabledPublished = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.actModeEnabledUserDefaultsKey)
+        if enabled {
+            ClickyAnalytics.trackActModeEnabled()
+        } else {
+            ClickyAnalytics.trackActModeDisabled()
+        }
+        print("🎬 Act mode: \(enabled ? "enabled" : "disabled")")
+    }
+
+    // MARK: - Accessibility health state (U12 stale-TCC self-check)
+
+    /// The result of the launch-time stale-TCC self-check.
+    ///
+    /// Updated once at launch (in `start()`) and again on demand via
+    /// `performAccessibilityHealthSelfCheck()`. The panel reads this to decide
+    /// whether to show the normal "Granted" badge, a "re-toggle" hint, or the
+    /// "Grant" button.
+    ///
+    /// Starts as `.notGranted` so the panel renders the correct initial state
+    /// before the first check completes.
+    @Published private(set) var accessibilityHealthState: AccessibilityHealthState = .notGranted
+
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from Claude's response;
     /// observed by BlueCursorView to trigger the flight animation.
@@ -288,6 +330,15 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
         }
+
+        // Phase D (act mode, U12): perform the stale-TCC self-check once at launch.
+        // Runs async on the AX serial queue so the main thread is never blocked.
+        // If the check discovers a stale grant, `accessibilityHealthState` is
+        // updated to `.staleGrantNeedsReToggle` and the panel surfaces the
+        // "re-toggle Accessibility" hint instead of the normal "Granted" badge.
+        Task {
+            await performAccessibilityHealthSelfCheck()
+        }
     }
 
     /// Called by BlueCursorView after the buddy finishes its pointing
@@ -486,6 +537,74 @@ final class CompanionManager: ObservableObject {
 
         if !previouslyHadAll && allPermissionsGranted {
             ClickyAnalytics.trackAllPermissionsGranted()
+        }
+    }
+
+    // MARK: - AX health self-check (U12)
+
+    /// Performs a cheap one-attribute AX read against the frontmost application
+    /// on the shared AX serial queue, then updates `accessibilityHealthState`
+    /// based on `WindowPositionManager.accessibilityHealthState(isProcessTrusted:trivialAXReadSucceeded:)`.
+    ///
+    /// Call at launch (from `start()`) and optionally on demand. The method is
+    /// async so the AX work runs off the main thread on the shared serial queue
+    /// owned by `AccessibilityElementInventoryService`. The result is published
+    /// back to the main actor.
+    ///
+    /// Frequency design: we run this ONCE at launch (not on every 1.5s poll)
+    /// because a trivial AX read on every tick would add unnecessary serial-queue
+    /// pressure. The panel's "re-toggle" hint persists until the user acts; a
+    /// second on-demand check fires if they tap the hint link (showing the hint
+    /// caused them to toggle, so re-checking then is useful).
+    @MainActor
+    func performAccessibilityHealthSelfCheck() async {
+        let isTrusted = AXIsProcessTrusted()
+
+        // If the OS says we're not trusted, we don't need to waste time on an
+        // AX read — the health state is .notGranted and we update immediately.
+        guard isTrusted else {
+            accessibilityHealthState = WindowPositionManager.accessibilityHealthState(
+                isProcessTrusted: false,
+                trivialAXReadSucceeded: false
+            )
+            return
+        }
+
+        // Perform a cheap one-attribute read on the shared AX serial queue.
+        // We read kAXRoleAttribute from the frontmost app element. Any non-error
+        // result counts as "read succeeded". We don't need the actual value.
+        let trivialReadSucceeded: Bool = await AccessibilityElementInventoryService.shared.performOnAXSerialQueue {
+            guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
+                // No frontmost app — treat as read failure so the check is
+                // conservative (might surface the hint briefly, but won't miss a
+                // real stale grant).
+                return false
+            }
+            let appElement = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+            var roleValue: AnyObject?
+            let readResult = AXUIElementCopyAttributeValue(
+                appElement,
+                kAXRoleAttribute as CFString,
+                &roleValue
+            )
+            // Any return other than .success (including .apiDisabled, .cannotComplete,
+            // .notImplemented) indicates the grant is stale or the AX subsystem
+            // is refusing calls.
+            return readResult == .success
+        }
+
+        // Publish back on the main actor (performOnAXSerialQueue already bridges
+        // back via async/await; this assignment runs on MainActor because the
+        // surrounding method is @MainActor).
+        accessibilityHealthState = WindowPositionManager.accessibilityHealthState(
+            isProcessTrusted: isTrusted,
+            trivialAXReadSucceeded: trivialReadSucceeded
+        )
+
+        if accessibilityHealthState == .staleGrantNeedsReToggle {
+            print("⚠️ AX health check: grant is STALE — trusted=true but read failed. Panel will show re-toggle hint.")
+        } else {
+            print("✅ AX health check: \(accessibilityHealthState)")
         }
     }
 
@@ -699,7 +818,7 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Prompt
 
-    private static let companionVoiceResponseSystemPrompt = """
+    private static let companionVoiceResponseSystemPromptBase = """
     you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
@@ -777,6 +896,62 @@ final class CompanionManager: ObservableObject {
 
     keep walkthrough instructions short and concrete. one action per step. no multi-part steps.
     """
+
+    // MARK: - Act-mode prompt grammar (U12)
+
+    /// The paragraph appended to the system prompt when act mode is enabled.
+    ///
+    /// DESIGN: the CLICK/TYPE grammar is ONLY advertised when act mode is on.
+    /// This is the prompt-level gate: Claude never sees the grammar — and therefore
+    /// never proposes actions — unless the user explicitly opted in. It works
+    /// alongside the execution-level gate in PendingActionStateMachine for defence
+    /// in depth: a jailbroken model response still cannot execute actions when the
+    /// toggle is off because filterActionsForEnqueuing drops them before any panel
+    /// is shown.
+    ///
+    /// Voice matches the rest of the prompt: lowercase, casual, action-oriented.
+    /// No newlines in TYPE text is enforced here (at the prompt level) AND in
+    /// ActionExecutionService (at the execution level) — belt and braces.
+    private static let actModeGrammarParagraph = """
+
+    act mode (enabled):
+    the user has turned on act mode. this means you can click buttons and type text on their behalf — but every action requires their explicit confirmation before anything happens. they'll see a preview panel and must press return to confirm or esc to cancel.
+
+    when the user asks you to do something for them and act mode is on, emit action tags anywhere in your response (they're stripped before being spoken, so never describe them out loud and never end a sentence with one):
+    - to click a UI element: [CLICK:E<id>:short plain-english description]
+    - to type text into a field: [TYPE:E<id>:text to type:short plain-english description]
+
+    element IDs (E1, E2, …) come ONLY from the current interactive-elements inventory. never use an ID from a previous turn — they change every interaction.
+
+    rules for act mode:
+    - every action requires user confirmation. never assume confirmation.
+    - never type into password fields (AXSecureTextField). if the target is a secure field, describe what to do instead.
+    - never include newlines or control characters in TYPE text — only plain text the user can read in the preview.
+    - keep descriptions honest and brief: "click Save" not "click the big important Save button".
+    - if the inventory is absent or the target element isn't in it, describe the action in words instead of emitting a tag.
+
+    examples:
+    - user says "click save for me": "got it. [CLICK:E5:click Save button]"
+    - user says "fill in my name": "filling that in. [TYPE:E3:Jane Smith:type name into Name field]"
+    - user says "submit the form": "on it. [TYPE:E2:Jane Smith:fill Name] [TYPE:E4:jane@example.com:fill Email] then [CLICK:E7:click Submit]"
+    """
+
+    /// Returns the system prompt for a normal (non-verification) companion turn.
+    ///
+    /// Converted from a `static let` to a `static func` (U12) so the act-mode
+    /// grammar paragraph is appended conditionally at request time. This is a
+    /// pure function — same inputs always produce the same output — so it is
+    /// directly unit-testable without constructing a CompanionManager.
+    ///
+    /// - Parameter actModeEnabled: When true the CLICK/TYPE grammar paragraph is
+    ///   appended; when false the base prompt is returned unchanged so Claude
+    ///   never learns the grammar and cannot propose actions.
+    /// - Returns: The complete system prompt string ready to pass to the API.
+    static func companionVoiceResponseSystemPrompt(actModeEnabled: Bool) -> String {
+        actModeEnabled
+            ? companionVoiceResponseSystemPromptBase + actModeGrammarParagraph
+            : companionVoiceResponseSystemPromptBase
+    }
 
     // MARK: - AI Response Pipeline
 
@@ -939,17 +1114,24 @@ final class CompanionManager: ObservableObject {
                 // step after answering. The help-turn augment is built inline here so
                 // it stays close to the dispatch site and is easy to read.
                 let effectiveSystemPrompt: String = {
+                    // U12: pass the current act-mode state into the prompt builder
+                    // so the CLICK/TYPE grammar paragraph is included only when
+                    // act mode is on. This is checked at request time (not at startup)
+                    // so toggling act mode mid-session takes effect on the next turn.
+                    let basePrompt = Self.companionVoiceResponseSystemPrompt(
+                        actModeEnabled: isActModeEnabled
+                    )
                     let snapshot = walkthroughController.currentSnapshot
                     guard snapshot.phase == .awaitingUserAction,
                           !snapshot.declaredSteps.isEmpty else {
-                        return Self.companionVoiceResponseSystemPrompt
+                        return basePrompt
                     }
                     let currentStepIndex = snapshot.currentStepIndex
                     let currentInstruction = currentStepIndex < snapshot.declaredSteps.count
                         ? snapshot.declaredSteps[currentStepIndex].instruction
                         : ""
                     let stepContext = "the user is mid-walkthrough (step \(currentStepIndex + 1) of \(snapshot.totalStepCount): \"\(currentInstruction)\"). answer their question, then remind them to go back to the current step when ready. do not advance the walkthrough or emit [STEP:] or [VERIFY:] tags."
-                    return Self.companionVoiceResponseSystemPrompt + "\n\n" + stepContext
+                    return basePrompt + "\n\n" + stepContext
                 }()
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(

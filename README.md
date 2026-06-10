@@ -133,6 +133,12 @@ The app will appear in your menu bar (not the dock). Click the icon to open the 
 - **Screen Recording** — for taking screenshots when you use the hotkey
 - **Screen Content** — for ScreenCaptureKit access
 
+## What it can do now
+
+Clicky can ground its pointing in the macOS accessibility tree so the cursor lands on the exact center of UI elements instead of guessing from a screenshot. It can draw annotation shapes (boxes, circles, arrows, highlights) over multiple elements at once. It can walk you through multi-step processes one step at a time, check whether you completed each step from a fresh screenshot, and loop back with a specific hint if you didn't.
+
+And if you turn on **act mode** (off by default, toggle it in the panel) Clicky can click buttons and type text for you — every single action shows you a confirmation panel first, you press Return to confirm or Esc to cancel, and nothing happens without your explicit go-ahead.
+
 ## Architecture
 
 If you want the full technical breakdown, read `CLAUDE.md`. But here's the short version:

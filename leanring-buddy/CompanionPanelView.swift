@@ -58,6 +58,18 @@ struct CompanionPanelView: View {
             //         .padding(.horizontal, 16)
             // }
 
+            // Act mode section — shown when the user has completed onboarding
+            // and all permissions are granted (same gate as the model picker).
+            // Hidden during an active walkthrough so the section list stays clean.
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
+                && companionManager.walkthroughController.phase == .inactive {
+                Spacer()
+                    .frame(height: 12)
+
+                actModeSection
+                    .padding(.horizontal, 16)
+            }
+
             // Active walkthrough section — shown whenever a walkthrough is in
             // progress (phase != .inactive). Cross-fades in/out by opacity so the
             // panel doesn't jump; the section is always in the view tree.
@@ -277,72 +289,107 @@ struct CompanionPanelView: View {
 
     private var accessibilityPermissionRow: some View {
         let isGranted = companionManager.hasAccessibilityPermission
-        return HStack {
-            HStack(spacing: 8) {
-                Image(systemName: "hand.raised")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
-                    .frame(width: 16)
+        let axHealthState = companionManager.accessibilityHealthState
 
-                Text("Accessibility")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "hand.raised")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
+                        .frame(width: 16)
+
+                    Text("Accessibility")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                if isGranted && axHealthState == .staleGrantNeedsReToggle {
+                    // Stale-TCC hint: the grant exists in TCC but the AX subsystem
+                    // is not servicing calls. Show a warning badge instead of
+                    // the normal "Granted" green dot so the user knows to re-toggle.
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.warning)
+                        Text("Stale")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.warning)
+                    }
+                } else if isGranted {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(DS.Colors.success)
+                            .frame(width: 6, height: 6)
+                        Text("Granted")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.success)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Button(action: {
+                            // Triggers the system accessibility prompt (AXIsProcessTrustedWithOptions)
+                            // on first attempt, then opens System Settings on subsequent attempts.
+                            WindowPositionManager.requestAccessibilityPermission()
+                        }) {
+                            Text("Grant")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(DS.Colors.textOnAccent)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .fill(DS.Colors.accent)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .pointerCursor()
+
+                        Button(action: {
+                            // Reveals the app in Finder so the user can drag it into
+                            // the Accessibility list if it doesn't appear automatically
+                            // (common with unsigned dev builds).
+                            WindowPositionManager.revealAppInFinder()
+                            WindowPositionManager.openAccessibilitySettings()
+                        }) {
+                            Text("Find App")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .pointerCursor()
+                    }
+                }
             }
+            .padding(.vertical, 6)
 
-            Spacer()
-
-            if isGranted {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(DS.Colors.success)
-                        .frame(width: 6, height: 6)
-                    Text("Granted")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
-                }
-            } else {
-                HStack(spacing: 6) {
-                    Button(action: {
-                        // Triggers the system accessibility prompt (AXIsProcessTrustedWithOptions)
-                        // on first attempt, then opens System Settings on subsequent attempts.
-                        WindowPositionManager.requestAccessibilityPermission()
-                    }) {
-                        Text("Grant")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(DS.Colors.textOnAccent)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(DS.Colors.accent)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-
-                    Button(action: {
-                        // Reveals the app in Finder so the user can drag it into
-                        // the Accessibility list if it doesn't appear automatically
-                        // (common with unsigned dev builds).
-                        WindowPositionManager.revealAppInFinder()
+            // Stale-TCC hint row — shown ONLY when the grant is present but stale.
+            // Opening System Settings and toggling the grant off then on forces macOS
+            // to issue a fresh TCC entry, which cures the kAXErrorAPIDisabled failure.
+            // The hint uses the deep-link URL pattern (same as requestAccessibilityPermission).
+            if isGranted && axHealthState == .staleGrantNeedsReToggle {
+                AccessibilityStaleGrantHintRow(
+                    onOpenSettings: {
                         WindowPositionManager.openAccessibilitySettings()
-                    }) {
-                        Text("Find App")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(DS.Colors.textSecondary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
-                            )
+                        // Re-run the self-check after the user returns from System
+                        // Settings so the hint disappears automatically once they
+                        // re-toggle the grant.
+                        Task {
+                            await companionManager.performAccessibilityHealthSelfCheck()
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-                }
+                )
+                .padding(.bottom, 6)
             }
         }
-        .padding(.vertical, 6)
     }
 
     private var screenRecordingPermissionRow: some View {
@@ -556,6 +603,77 @@ struct CompanionPanelView: View {
     }
 
 
+
+    // MARK: - Act Mode Section (U12)
+
+    /// Act-mode toggle section. Shown when the user has completed onboarding
+    /// and all permissions are granted.
+    ///
+    /// Styling exactly matches the `settingsSection` / walkthrough section pattern:
+    /// section header in PERMISSIONS label style, the toggle row uses the same
+    /// padding and spacing as other rows, and the explanatory copy uses
+    /// `textTertiary` at 11pt matching the "Quit and reopen after granting" hint
+    /// in the screen recording row.
+    private var actModeSection: some View {
+        VStack(spacing: 2) {
+            // Section header — matches PERMISSIONS label style exactly
+            Text("ACT MODE")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 6)
+
+            actModeToggleRow
+        }
+    }
+
+    /// The toggle row for act mode.
+    ///
+    /// Uses `.tint(DS.Colors.accent)` and `.scaleEffect(0.8)` matching the
+    /// `showClickyCursorToggleRow` pattern already in this file. Pointer cursor
+    /// and hover feedback on every interactive element per AGENTS.md rules.
+    private var actModeToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "cursorarrow.click")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Act mode")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                // Toggle bound to the @Published wrapper on CompanionManager.
+                // Writing through `setActModeEnabled` keeps UserDefaults and the
+                // @Published state in sync and fires analytics.
+                Toggle("", isOn: Binding(
+                    get: { companionManager.isActModeEnabledPublished },
+                    set: { companionManager.setActModeEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+                // Pointer cursor on the toggle itself so it communicates clickability.
+                .pointerCursor()
+            }
+            .padding(.vertical, 4)
+
+            // Explanatory copy — explains what act mode does and that every
+            // action requires confirmation. Matches the screen recording row's
+            // secondary hint style (11pt textTertiary).
+            Text("clicky can click and type for you — every action needs your confirmation first")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 4)
+        }
+    }
 
     // MARK: - Active Walkthrough Section
 
@@ -939,5 +1057,52 @@ private struct WalkthroughCancelButton: View {
         }
         .animation(.easeOut(duration: DS.Animation.fast), value: isHovered)
         .padding(.vertical, 2)
+    }
+}
+
+// MARK: - Stale accessibility grant hint row (U12)
+
+/// Hint row shown inside `accessibilityPermissionRow` when
+/// `accessibilityHealthState == .staleGrantNeedsReToggle`.
+///
+/// The TCC entry exists (`AXIsProcessTrusted()` returns true) but the AX
+/// subsystem is refusing calls — a common symptom after re-signing a dev build
+/// or after a macOS update that invalidates the cached grant. The fix is to
+/// toggle the grant off and back on in System Settings → Privacy & Security →
+/// Accessibility.
+///
+/// Styled as a compact warning hint: amber text, indented under the row icon,
+/// smaller than normal rows so it reads as contextual help rather than a
+/// primary action.
+private struct AccessibilityStaleGrantHintRow: View {
+    /// Called when the user taps "Open Settings". The parent re-runs the
+    /// self-check after the user returns so the hint disappears automatically.
+    let onOpenSettings: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("accessibility looks granted but isn't responding — toggle it off and on in System Settings → Privacy & Security → Accessibility")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.warning)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button(action: onOpenSettings) {
+                Text("Open Settings")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(isHovered ? DS.Colors.warning : DS.Colors.warningText)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .onHover { hoveringOverLink in
+                isHovered = hoveringOverLink
+            }
+            .animation(.easeOut(duration: DS.Animation.fast), value: isHovered)
+        }
+        // Indent to align under the "Accessibility" label text (icon width 16 + spacing 8)
+        .padding(.leading, 24)
+        .padding(.top, 2)
     }
 }
