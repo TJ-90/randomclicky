@@ -197,6 +197,16 @@ final class CompanionManager: ObservableObject {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
 
+    /// OpenRouter vision client, allocated once on first use.
+    ///
+    /// Only touched when ~/Library/Application Support/Clicky/llm.json is
+    /// present and specifies "openrouter" as the provider. The API key is
+    /// read from that file at call time — it is never stored in this property
+    /// or anywhere else in the binary.
+    private lazy var openRouterAPI: OpenRouterAPI = {
+        return OpenRouterAPI()
+    }()
+
     // Internal (not private): the CompanionManager+PendingAction extension lives in a
     // separate file and speaks action outcomes through this client.
     lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -1195,16 +1205,39 @@ final class CompanionManager: ObservableObject {
                     return basePrompt + "\n\n" + stepContext
                 }()
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: effectiveSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    supplementalContextText: supplementalInventoryTextBlock,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    }
-                )
+                // Provider switch: if the user has placed a local llm.json config at
+                // ~/Library/Application Support/Clicky/llm.json specifying "openrouter"
+                // as the provider, route this vision request through OpenRouterAPI instead
+                // of the default Claude-via-Worker path. The API key lives only on disk and
+                // is never shipped in the app binary or the Cloudflare Worker.
+                let llmProviderConfig = LLMProviderConfiguration.loadFromDisk()
+
+                let fullResponseText: String
+                if let openRouterConfig = llmProviderConfig, openRouterConfig.usesOpenRouter {
+                    print("🔀 Using OpenRouter provider — model: \(openRouterConfig.model)")
+                    fullResponseText = try await openRouterAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: effectiveSystemPrompt,
+                        conversationHistory: historyForAPI,
+                        userPrompt: transcript,
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        apiKey: openRouterConfig.apiKey,
+                        model: openRouterConfig.model
+                    )
+                } else {
+                    // Default path: Claude via Cloudflare Worker proxy (streaming).
+                    let (claudeResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                        images: labeledImages,
+                        systemPrompt: effectiveSystemPrompt,
+                        conversationHistory: historyForAPI,
+                        userPrompt: transcript,
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        onTextChunk: { _ in
+                            // No streaming text display — spinner stays until TTS plays
+                        }
+                    )
+                    fullResponseText = claudeResponseText
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -1787,14 +1820,37 @@ final class CompanionManager: ObservableObject {
                 // context is carried in the system prompt itself (so truncation cannot
                 // lose it). The conversation history window is for user-Claude dialogue;
                 // the verification turn is a protocol exchange, not a conversation turn.
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: verificationSystemPrompt,
-                    conversationHistory: [],
-                    userPrompt: "please verify whether I completed the current step",
-                    supplementalContextText: supplementalInventoryTextBlock,
-                    onTextChunk: { _ in }
-                )
+                //
+                // Provider switch: same logic as sendTranscriptToClaudeWithScreenshot —
+                // use OpenRouter when llm.json is present and specifies "openrouter",
+                // so walkthroughs also benefit from the locally-configured vision model.
+                let verificationLLMProviderConfig = LLMProviderConfiguration.loadFromDisk()
+
+                let fullResponseText: String
+                if let openRouterVerificationConfig = verificationLLMProviderConfig,
+                   openRouterVerificationConfig.usesOpenRouter {
+                    print("🔀 Walkthrough verification using OpenRouter provider — model: \(openRouterVerificationConfig.model)")
+                    fullResponseText = try await openRouterAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: verificationSystemPrompt,
+                        conversationHistory: [],
+                        userPrompt: "please verify whether I completed the current step",
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        apiKey: openRouterVerificationConfig.apiKey,
+                        model: openRouterVerificationConfig.model
+                    )
+                } else {
+                    // Default path: Claude via Cloudflare Worker proxy (streaming).
+                    let (claudeVerificationResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                        images: labeledImages,
+                        systemPrompt: verificationSystemPrompt,
+                        conversationHistory: [],
+                        userPrompt: "please verify whether I completed the current step",
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        onTextChunk: { _ in }
+                    )
+                    fullResponseText = claudeVerificationResponseText
+                }
 
                 guard !Task.isCancelled else { return }
 
