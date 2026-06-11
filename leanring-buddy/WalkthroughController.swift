@@ -31,6 +31,7 @@
 //
 
 import SwiftUI
+import Combine // ObservableObject / @Published live in Combine; SwiftUI does not re-export them
 
 // MARK: - WalkthroughPhase
 
