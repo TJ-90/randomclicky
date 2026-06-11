@@ -1,0 +1,64 @@
+name: Build & Test (macOS)
+
+# Builds Clicky and runs the unit-test suite on a GitHub-hosted macOS runner.
+# This is the way to verify the code compiles and the pure-logic tests pass
+# WITHOUT installing Xcode locally — the runner already has it.
+#
+# What this CANNOT verify (intrinsically needs a real interactive Mac with TCC
+# grants and you at the keyboard): the --confirmation-panel-spike, pointing
+# accuracy, real synthetic clicks/typing, multi-monitor behaviour, and the
+# permission flows. Those remain manual.
+#
+# Note: running xcodebuild here does NOT violate the repo's "no terminal
+# xcodebuild" rule — that rule protects the developer's local TCC permission
+# grants. A throwaway CI runner has none to invalidate.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PROJECT: leanring-buddy.xcodeproj
+      SCHEME: leanring-buddy
+      # Unsigned build — CI has no signing identity and unit tests don't need one.
+      SIGNING_FLAGS: >-
+        CODE_SIGNING_ALLOWED=NO
+        CODE_SIGNING_REQUIRED=NO
+        CODE_SIGN_IDENTITY=
+        DEVELOPMENT_TEAM=
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve Swift Package dependencies (Sparkle, PostHog)
+        run: xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME"
+
+      - name: Build for testing (compile app + tests, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination 'platform=macOS' \
+            $SIGNING_FLAGS
+
+      - name: Run unit tests
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination 'platform=macOS' \
+            -only-testing:leanring-buddyTests \
+            $SIGNING_FLAGS
