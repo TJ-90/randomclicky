@@ -60,7 +60,8 @@ jobs:
 
       - name: Package the built .app
         run: |
-          APP_PATH="./DerivedDataApp/Build/Products/Debug/leanring-buddy.app"
+          # The product name is "Clicky" (display name), not the target name "leanring-buddy".
+          APP_PATH="./DerivedDataApp/Build/Products/Debug/Clicky.app"
           if [ ! -d "$APP_PATH" ]; then
             echo "No .app at $APP_PATH"; ls -R ./DerivedDataApp/Build/Products || true; exit 1
           fi
