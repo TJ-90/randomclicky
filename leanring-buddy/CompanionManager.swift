@@ -197,7 +197,9 @@ final class CompanionManager: ObservableObject {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
 
-    private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
+    // Internal (not private): the CompanionManager+PendingAction extension lives in a
+    // separate file and speaks action outcomes through this client.
+    lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
 
@@ -1260,7 +1262,9 @@ final class CompanionManager: ObservableObject {
                 if let step = walkthroughParseResult.step {
                     // Store so the post-TTS block below can fire stepPresented once
                     // the user has heard the instruction.
-                    pendingWalkthroughStepAfterTTS = step
+                    // Convert the parser's ParsedWalkthroughStep into the controller's
+                    // WalkthroughStep (same fields, distinct types across the parse/state layers).
+                    pendingWalkthroughStepAfterTTS = WalkthroughStep(stepNumber: step.stepNumber, instruction: step.instruction)
                     print("📋 Walkthrough step \(step.stepNumber) pending TTS: \"\(step.instruction)\"")
                 }
 
@@ -1810,7 +1814,7 @@ final class CompanionManager: ObservableObject {
                     from: annotationParseResult.strippedText
                 )
                 if let nextStep = walkthroughParseResult.step {
-                    pendingWalkthroughStepAfterTTS = nextStep
+                    pendingWalkthroughStepAfterTTS = WalkthroughStep(stepNumber: nextStep.stepNumber, instruction: nextStep.instruction)
                 }
 
                 // --- Parse the verification verdict ---

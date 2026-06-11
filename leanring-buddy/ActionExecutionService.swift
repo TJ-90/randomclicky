@@ -166,7 +166,10 @@ final class ActionExecutionService {
     /// Used by `GlobalPushToTalkShortcutMonitor.handleGlobalEventTap` to skip
     /// Clicky's own synthetic events, and by the user-activity sampler inside
     /// this service to exclude its own events from the HID-quiescence check.
-    static func isClickySyntheticEvent(_ event: CGEvent) -> Bool {
+    // nonisolated: the listen-only CGEvent tap callback in GlobalPushToTalkShortcutMonitor
+    // runs on its run-loop thread (not the main actor) and calls this to skip Clicky's own
+    // synthetic events. It only reads an event field against an immutable constant — safe.
+    nonisolated static func isClickySyntheticEvent(_ event: CGEvent) -> Bool {
         return event.getIntegerValueField(.eventSourceUserData) == syntheticEventUserDataMagicValue
     }
 
