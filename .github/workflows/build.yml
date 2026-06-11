@@ -60,9 +60,19 @@ jobs:
       - name: Run unit tests
         run: |
           set -o pipefail
-          xcodebuild test \
+          # build-for-testing + test-without-building with a dedicated DerivedData
+          # path. build-for-testing builds the host app and test bundle in a single
+          # graph and emits an .xctestrun, which resolves the hosted-test-target host
+          # that a plain `xcodebuild test` would not schedule on CI.
+          xcodebuild build-for-testing \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
-            -destination "$DESTINATION" \
-            -only-testing:leanring-buddyTests \
+            -destination 'platform=macOS' \
+            -derivedDataPath ./DerivedDataTest \
+            $SIGNING_FLAGS
+          xcodebuild test-without-building \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination 'platform=macOS' \
+            -derivedDataPath ./DerivedDataTest \
             $SIGNING_FLAGS
