@@ -55,7 +55,25 @@ jobs:
             -project "$PROJECT" \
             -scheme "$SCHEME" \
             -destination "$DESTINATION" \
+            -derivedDataPath ./DerivedDataApp \
             $SIGNING_FLAGS
+
+      - name: Package the built .app
+        run: |
+          APP_PATH="./DerivedDataApp/Build/Products/Debug/leanring-buddy.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "No .app at $APP_PATH"; ls -R ./DerivedDataApp/Build/Products || true; exit 1
+          fi
+          # ditto preserves the bundle structure, symlinks, and exec bits in the zip.
+          ditto -c -k --keepParent "$APP_PATH" clicky-app.zip
+          ls -lh clicky-app.zip
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clicky-app
+          path: clicky-app.zip
+          if-no-files-found: error
 
       - name: Run unit tests
         # Non-blocking: the leanring-buddyTests target is a *hosted* test bundle
