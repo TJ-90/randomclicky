@@ -58,6 +58,35 @@ jobs:
             -derivedDataPath ./DerivedDataApp \
             $SIGNING_FLAGS
 
+      - name: Re-sign app with stable self-signed identity
+        env:
+          P12_BASE64: ${{ secrets.CLICKY_SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CLICKY_SIGNING_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.CLICKY_KEYCHAIN_PASSWORD }}
+          SIGNING_IDENTITY: "Clicky Self-Signed"
+        run: |
+          set -euo pipefail
+          APP_PATH="./DerivedDataApp/Build/Products/Debug/Clicky.app"
+          KEYCHAIN="$RUNNER_TEMP/clicky-signing.keychain-db"
+          # Import the self-signed cert into a temp keychain so every build is signed
+          # with the SAME identity -> macOS treats rebuilds as the same app, and TCC
+          # permission grants (Accessibility, Screen Recording) persist across builds.
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          # --force replaces the ad-hoc signature; --deep covers nested frameworks
+          # (Sparkle); entitlements preserved; no secure timestamp for a self-signed cert.
+          codesign --force --deep --timestamp=none \
+            --entitlements "leanring-buddy/leanring-buddy.entitlements" \
+            --sign "$SIGNING_IDENTITY" --keychain "$KEYCHAIN" "$APP_PATH"
+          echo "=== resulting signature ==="
+          codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE 'Authority|Identifier|Signature|flags' || true
+          rm -f "$RUNNER_TEMP/cert.p12"
+
       - name: Package the built .app
         run: |
           # The product name is "Clicky" (display name), not the target name "leanring-buddy".
