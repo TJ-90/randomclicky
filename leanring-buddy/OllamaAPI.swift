@@ -222,8 +222,8 @@ class OllamaAPI {
             // model is taking longer than 180s (e.g. very first cold start of
             // a large model on constrained hardware).
             let userFriendlyConnectionErrors: [Int] = [
-                NSURLErrorCannotConnectToHost,    // Ollama not running / wrong port
-                NSURLErrorConnectionRefused,      // explicit ECONNREFUSED
+                NSURLErrorCannotConnectToHost,    // Ollama not running / wrong port (covers ECONNREFUSED)
+                NSURLErrorCannotFindHost,         // localhost unresolvable
                 NSURLErrorNetworkConnectionLost,  // connection dropped mid-inference
                 NSURLErrorTimedOut                // 180s request timeout exceeded
             ]
