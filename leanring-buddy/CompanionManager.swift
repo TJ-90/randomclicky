@@ -207,6 +207,17 @@ final class CompanionManager: ObservableObject {
         return OpenRouterAPI()
     }()
 
+    /// Ollama local vision client, allocated once on first use.
+    ///
+    /// Only touched when ~/Library/Application Support/Clicky/llm.json is
+    /// present and specifies "ollama" as the provider. No API key is needed —
+    /// Ollama is a local server that ignores the Authorization header. The
+    /// client is configured with long timeouts (180s request / 240s resource)
+    /// to accommodate cold-start loading of a local 4.7B model on an M1.
+    private lazy var ollamaAPI: OllamaAPI = {
+        return OllamaAPI()
+    }()
+
     // Internal (not private): the CompanionManager+PendingAction extension lives in a
     // separate file and speaks action outcomes through this client.
     lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -1206,10 +1217,11 @@ final class CompanionManager: ObservableObject {
                 }()
 
                 // Provider switch: if the user has placed a local llm.json config at
-                // ~/Library/Application Support/Clicky/llm.json specifying "openrouter"
-                // as the provider, route this vision request through OpenRouterAPI instead
-                // of the default Claude-via-Worker path. The API key lives only on disk and
-                // is never shipped in the app binary or the Cloudflare Worker.
+                // ~/Library/Application Support/Clicky/llm.json, route this vision request
+                // through the appropriate client instead of the default Claude-via-Worker
+                // path. Supported providers: "openrouter" (remote, API key required) and
+                // "ollama" (local localhost:11434, no API key needed). When the file is
+                // absent or invalid, the default Claude path is used.
                 let llmProviderConfig = LLMProviderConfiguration.loadFromDisk()
 
                 let fullResponseText: String
@@ -1223,6 +1235,17 @@ final class CompanionManager: ObservableObject {
                         supplementalContextText: supplementalInventoryTextBlock,
                         apiKey: openRouterConfig.apiKey,
                         model: openRouterConfig.model
+                    )
+                } else if let ollamaConfig = llmProviderConfig, ollamaConfig.usesOllama {
+                    // Local Ollama path — no API key, long timeouts for cold-start inference.
+                    print("🦙 Using Ollama provider — model: \(ollamaConfig.model)")
+                    fullResponseText = try await ollamaAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: effectiveSystemPrompt,
+                        conversationHistory: historyForAPI,
+                        userPrompt: transcript,
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        model: ollamaConfig.model
                     )
                 } else {
                     // Default path: Claude via Cloudflare Worker proxy (streaming).
@@ -1822,8 +1845,9 @@ final class CompanionManager: ObservableObject {
                 // the verification turn is a protocol exchange, not a conversation turn.
                 //
                 // Provider switch: same logic as sendTranscriptToClaudeWithScreenshot —
-                // use OpenRouter when llm.json is present and specifies "openrouter",
-                // so walkthroughs also benefit from the locally-configured vision model.
+                // use OpenRouter when llm.json specifies "openrouter", Ollama when it
+                // specifies "ollama", or fall back to Claude. Walkthroughs use the same
+                // locally-configured vision model as normal turns for consistency.
                 let verificationLLMProviderConfig = LLMProviderConfiguration.loadFromDisk()
 
                 let fullResponseText: String
@@ -1838,6 +1862,18 @@ final class CompanionManager: ObservableObject {
                         supplementalContextText: supplementalInventoryTextBlock,
                         apiKey: openRouterVerificationConfig.apiKey,
                         model: openRouterVerificationConfig.model
+                    )
+                } else if let ollamaVerificationConfig = verificationLLMProviderConfig,
+                          ollamaVerificationConfig.usesOllama {
+                    // Local Ollama path — no API key, long timeouts for cold-start inference.
+                    print("🦙 Walkthrough verification using Ollama provider — model: \(ollamaVerificationConfig.model)")
+                    fullResponseText = try await ollamaAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: verificationSystemPrompt,
+                        conversationHistory: [],
+                        userPrompt: "please verify whether I completed the current step",
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        model: ollamaVerificationConfig.model
                     )
                 } else {
                     // Default path: Claude via Cloudflare Worker proxy (streaming).
