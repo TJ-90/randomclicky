@@ -852,9 +852,20 @@ final class AccessibilityElementInventoryService: ObservableObject {
             guard shouldKeep else { continue }
 
             // --- Extract position and size from AXValue wrappers ---
+            // AXValue is a CoreFoundation type — `as? AXValue` is a conditional CF
+            // downcast that the compiler flags as "will always succeed" because CF
+            // types are always truthy from Swift's perspective. Use the same
+            // CFGetTypeID guard + unsafeBitCast pattern established in getWindowCGFrame
+            // to validate the CF type before casting. If either attribute is not
+            // actually an AXValue (e.g. a misbehaving app returned a wrong type),
+            // we leave elementCGFrame as .zero and let the visibility heuristic skip it.
             var elementCGFrame = CGRect.zero
-            if let positionAXValue = batchResults[5] as? AXValue,
-               let sizeAXValue = batchResults[6] as? AXValue {
+            let positionRawObject = batchResults[5]
+            let sizeRawObject = batchResults[6]
+            if CFGetTypeID(positionRawObject) == AXValueGetTypeID(),
+               CFGetTypeID(sizeRawObject) == AXValueGetTypeID() {
+                let positionAXValue = unsafeBitCast(positionRawObject, to: AXValue.self)
+                let sizeAXValue = unsafeBitCast(sizeRawObject, to: AXValue.self)
                 var position = CGPoint.zero
                 var size = CGSize.zero
                 AXValueGetValue(positionAXValue, .cgPoint, &position)

@@ -48,6 +48,7 @@
 
 import AppKit
 import ApplicationServices
+import Carbon
 import CoreGraphics
 import Darwin
 import Foundation
@@ -565,7 +566,7 @@ final class ActionExecutionService {
     ///
     /// - Parameter targetElement: The element as captured during the inventory walk.
     /// - Returns: `.proceed`, `.staleTarget`, or `.aborted`.
-    static func revalidateTargetElement(_ targetElement: AccessibleElement) -> RevalidationOutcome {
+    nonisolated static func revalidateTargetElement(_ targetElement: AccessibleElement) -> RevalidationOutcome {
         let axHandle = targetElement.axElementHandle
 
         // Tighten the messaging timeout before issuing attribute reads so a hung
@@ -620,10 +621,21 @@ final class ActionExecutionService {
         // compute a click target without knowing where the element is now.
         guard positionReadResult == .success,
               sizeReadResult == .success,
-              let positionAXValue = positionValue as? AXValue,
-              let sizeAXValue = sizeValue as? AXValue else {
+              let positionRaw = positionValue,
+              let sizeRaw = sizeValue else {
             return .staleTarget
         }
+
+        // AXValue is a CoreFoundation opaque type: `as? AXValue` always succeeds
+        // (the compiler warns "conditional downcast will always succeed") because
+        // Swift cannot verify CF type identity at compile time. The correct pattern
+        // is to guard on the runtime CFTypeID before doing an unconditional cast.
+        guard CFGetTypeID(positionRaw) == AXValueGetTypeID(),
+              CFGetTypeID(sizeRaw) == AXValueGetTypeID() else {
+            return .staleTarget
+        }
+        let positionAXValue = positionRaw as! AXValue
+        let sizeAXValue = sizeRaw as! AXValue
 
         var livePosition = CGPoint.zero
         var liveSize = CGSize.zero
@@ -655,7 +667,7 @@ final class ActionExecutionService {
     ///   - storedCGFrameCenter: The element's frame center from the inventory walk.
     /// - Returns: `.proceed` if the frame is stable within epsilon, `.staleTarget`
     ///   if the AX read failed or the frame drifted beyond epsilon.
-    static func evaluateRevalidationDecision(
+    nonisolated static func evaluateRevalidationDecision(
         axReadSucceeded: Bool,
         liveCGFrameCenter: CGPoint,
         storedCGFrameCenter: CGPoint
@@ -745,7 +757,7 @@ final class ActionExecutionService {
     ///
     /// - Parameter axElementHandle: The live AX handle for the target element.
     /// - Returns: `true` if the value attribute is settable.
-    static func isValueAttributeSettable(axElementHandle: AXUIElement) -> Bool {
+    nonisolated static func isValueAttributeSettable(axElementHandle: AXUIElement) -> Bool {
         var isSettable: DarwinBoolean = false
         let result = AXUIElementIsAttributeSettable(
             axElementHandle,
@@ -956,7 +968,7 @@ final class ActionExecutionService {
     /// Returns true if the element exposes `kAXPressAction` in its action names.
     ///
     /// MUST be called on the AX serial queue.
-    static func checkElementHasPressAction(axHandle: AXUIElement) -> Bool {
+    nonisolated static func checkElementHasPressAction(axHandle: AXUIElement) -> Bool {
         var actionNames: CFArray?
         guard AXUIElementCopyActionNames(axHandle, &actionNames) == .success,
               let names = actionNames as? [String] else {
@@ -975,7 +987,7 @@ final class ActionExecutionService {
     /// Attempts `kAXPressAction` on the element.
     ///
     /// MUST be called on the AX serial queue.
-    static func attemptAXPressAction(axHandle: AXUIElement) -> StageAttemptResult {
+    nonisolated static func attemptAXPressAction(axHandle: AXUIElement) -> StageAttemptResult {
         let result = AXUIElementPerformAction(axHandle, kAXPressAction as CFString)
         switch result {
         case .success:
@@ -990,7 +1002,7 @@ final class ActionExecutionService {
     /// Attempts to set `kAXValueAttribute` on the element to `textToType`.
     ///
     /// MUST be called on the AX serial queue.
-    static func attemptAXValueSet(axHandle: AXUIElement, textToType: String) -> StageAttemptResult {
+    nonisolated static func attemptAXValueSet(axHandle: AXUIElement, textToType: String) -> StageAttemptResult {
         let result = AXUIElementSetAttributeValue(
             axHandle,
             kAXValueAttribute as CFString,
@@ -1126,17 +1138,17 @@ final class ActionExecutionService {
             }
 
             chunk.withUnsafeBufferPointer { bufferPointer in
-                // CGEventKeyboardSetUnicodeString takes a count and a pointer to
-                // UTF-16 code units. We pass the chunk's buffer directly.
-                CGEventKeyboardSetUnicodeString(
-                    keyDownEvent,
-                    chunk.count,
-                    bufferPointer.baseAddress
+                // `CGEventKeyboardSetUnicodeString` (free function) was replaced by
+                // the instance method `CGEvent.keyboardSetUnicodeString(stringLength:unicodeString:)`
+                // in macOS 14 SDK. Both take the same UTF-16 count and pointer arguments;
+                // the instance form is called on the event object directly.
+                keyDownEvent.keyboardSetUnicodeString(
+                    stringLength: chunk.count,
+                    unicodeString: bufferPointer.baseAddress
                 )
-                CGEventKeyboardSetUnicodeString(
-                    keyUpEvent,
-                    chunk.count,
-                    bufferPointer.baseAddress
+                keyUpEvent.keyboardSetUnicodeString(
+                    stringLength: chunk.count,
+                    unicodeString: bufferPointer.baseAddress
                 )
             }
 
@@ -1228,7 +1240,7 @@ final class ActionExecutionService {
     /// different Swift object identities.
     ///
     /// MUST be called on the AX serial queue.
-    static func isElementCurrentlyFocused(_ elementHandle: AXUIElement) -> Bool {
+    nonisolated static func isElementCurrentlyFocused(_ elementHandle: AXUIElement) -> Bool {
         let systemWideElement = AXUIElementCreateSystemWide()
         var focusedElementValue: AnyObject?
         let readResult = AXUIElementCopyAttributeValue(

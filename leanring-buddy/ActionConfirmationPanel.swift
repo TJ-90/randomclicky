@@ -173,7 +173,15 @@ final class ActionConfirmationPanelController {
     }
 
     deinit {
-        invalidateExpiryTimer()
+        // `deinit` is nonisolated even though this class is @MainActor. Swift 5.10+
+        // flags a direct call to a @MainActor-isolated method here as an error.
+        // ActionConfirmationPanelController is always created, used, and torn down
+        // on the main actor (CompanionManager is @MainActor and is the sole owner),
+        // so assumeIsolated is correct: it documents the guarantee without allocating
+        // a Task or scheduling an async hop that could race with deallocation.
+        MainActor.assumeIsolated {
+            invalidateExpiryTimer()
+        }
     }
 
     // MARK: - Public API
