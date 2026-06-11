@@ -1,17 +1,21 @@
 name: Build & Test (macOS)
 
 # Builds Clicky and runs the unit-test suite on a GitHub-hosted macOS runner.
-# This is the way to verify the code compiles and the pure-logic tests pass
-# WITHOUT installing Xcode locally — the runner already has it.
+# This verifies the code compiles and the pure-logic tests pass WITHOUT a local
+# Xcode install — the runner already has it.
 #
 # What this CANNOT verify (intrinsically needs a real interactive Mac with TCC
-# grants and you at the keyboard): the --confirmation-panel-spike, pointing
+# grants and a person at the keyboard): the --confirmation-panel-spike, pointing
 # accuracy, real synthetic clicks/typing, multi-monitor behaviour, and the
 # permission flows. Those remain manual.
 #
 # Note: running xcodebuild here does NOT violate the repo's "no terminal
 # xcodebuild" rule — that rule protects the developer's local TCC permission
 # grants. A throwaway CI runner has none to invalidate.
+#
+# Signing: macOS apps build and run unsigned via ad-hoc "sign to run locally"
+# (CODE_SIGN_IDENTITY=-). CODE_SIGNING_ALLOWED=NO is an iOS-flavoured flag that
+# prevents a runnable host bundle and breaks the hosted unit-test target.
 
 on:
   push:
@@ -26,11 +30,11 @@ jobs:
     env:
       PROJECT: leanring-buddy.xcodeproj
       SCHEME: leanring-buddy
-      # Unsigned build — CI has no signing identity and unit tests don't need one.
+      DESTINATION: 'platform=macOS,arch=arm64'
       SIGNING_FLAGS: >-
-        CODE_SIGNING_ALLOWED=NO
+        CODE_SIGN_IDENTITY=-
         CODE_SIGNING_REQUIRED=NO
-        CODE_SIGN_IDENTITY=
+        CODE_SIGNING_ALLOWED=YES
         DEVELOPMENT_TEAM=
     steps:
       - name: Checkout
@@ -44,21 +48,21 @@ jobs:
       - name: Resolve Swift Package dependencies (Sparkle, PostHog)
         run: xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME"
 
-      - name: Build for testing (compile app + tests, unsigned)
+      - name: Build app (compile check)
         run: |
           set -o pipefail
-          xcodebuild build-for-testing \
+          xcodebuild build \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
-            -destination 'platform=macOS' \
+            -destination "$DESTINATION" \
             $SIGNING_FLAGS
 
       - name: Run unit tests
         run: |
           set -o pipefail
-          xcodebuild test-without-building \
+          xcodebuild test \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
-            -destination 'platform=macOS' \
+            -destination "$DESTINATION" \
             -only-testing:leanring-buddyTests \
             $SIGNING_FLAGS

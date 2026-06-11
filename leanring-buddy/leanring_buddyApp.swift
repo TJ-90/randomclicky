@@ -34,6 +34,15 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // When the app is launched as the XCTest host (CI or `xcodebuild test`),
+        // skip the live runtime machinery. The CGEvent tap, permission polling,
+        // and ScreenCaptureKit would hang or fail on a headless runner, and the
+        // unit tests exercise pure types directly without needing the running app.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            print("🧪 Clicky: launched as XCTest host — skipping runtime startup")
+            return
+        }
+
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
