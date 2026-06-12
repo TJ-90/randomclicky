@@ -330,6 +330,12 @@ final class CompanionManager: ObservableObject {
         // are live. The two subscriptions are independent and do not interfere.
         bindActModeKillSwitchObservation()
 
+        // Request Speech Recognition authorization up front so the prompt appears
+        // in a calm context at launch instead of racing the push-to-talk release
+        // (which cancels the start task before the dialog can surface). No-op once
+        // granted, or when the provider doesn't need speech recognition.
+        Task { await buddyDictationManager.prewarmSpeechRecognitionAuthorizationIfNeeded() }
+
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI

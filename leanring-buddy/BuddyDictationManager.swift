@@ -831,6 +831,20 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
     }
 
+    /// Requests Speech Recognition authorization once, at app launch, in a calm
+    /// activated context. During push-to-talk the start task is cancelled the
+    /// instant the shortcut is released, which aborts before the authorization
+    /// prompt can surface — and for a menu-bar (LSUIElement) app the prompt only
+    /// appears reliably when the app is active. Requesting it up front guarantees
+    /// the user gets exactly one prompt they can actually act on.
+    func prewarmSpeechRecognitionAuthorizationIfNeeded() async {
+        guard transcriptionProvider.requiresSpeechRecognitionPermission else { return }
+        guard SFSpeechRecognizer.authorizationStatus() == .notDetermined else { return }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        try? await Task.sleep(for: .milliseconds(300))
+        _ = await requestSpeechRecognitionPermissionIfNeeded()
+    }
+
     func openRelevantPrivacySettings() {
         let settingsURLString: String
 
