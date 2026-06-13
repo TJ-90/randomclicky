@@ -52,8 +52,16 @@ class OllamaAPI {
     /// leave message.content empty, so the app would see no reply at all.
     private static let nativeChatURL = URL(string: "http://localhost:11434/api/chat")!
 
-    /// Token ceiling (num_predict) matching the other providers.
+    /// Response token ceiling (num_predict).
     private static let maxTokens = 2048
+
+    /// Context window (num_ctx) for the request. Ollama defaults to only 4096
+    /// tokens, but Clicky's request (large system prompt + AX inventory + a
+    /// screenshot) is ~5000 tokens and overflowed that — Ollama returned
+    /// HTTP 400 "exceeds context", which the generic error path mis-reported as
+    /// "out of credits". qwen3-class models support far larger contexts; 16384
+    /// gives the prompt plus the 2048-token response comfortable headroom.
+    private static let contextWindowTokens = 16384
 
     // MARK: - Session
 
@@ -182,7 +190,7 @@ class OllamaAPI {
             "think": false,
             "stream": false,
             "messages": messages,
-            "options": ["num_predict": Self.maxTokens]
+            "options": ["num_predict": Self.maxTokens, "num_ctx": Self.contextWindowTokens]
         ]
 
         let requestBodyData = try JSONSerialization.data(withJSONObject: requestBody)
