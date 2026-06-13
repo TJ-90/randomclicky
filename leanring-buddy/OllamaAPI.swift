@@ -45,22 +45,14 @@ class OllamaAPI {
 
     // MARK: - Constants
 
-    /// The Ollama OpenAI-compatible completions endpoint running on localhost.
-    ///
-    /// This is the standard Ollama default. If the user runs Ollama on a
-    /// non-default port they must change this; for now the default covers
-    /// virtually all Ollama installations.
-    private static let chatCompletionsURL = URL(string: "http://localhost:11434/v1/chat/completions")!
+    /// Ollama's NATIVE chat endpoint on localhost. We use /api/chat rather than
+    /// the OpenAI-compatible /v1/chat/completions because only the native
+    /// endpoint supports `think: false` — without it, reasoning models like
+    /// qwen3.5:4b put their entire answer in the (separate) thinking field and
+    /// leave message.content empty, so the app would see no reply at all.
+    private static let nativeChatURL = URL(string: "http://localhost:11434/api/chat")!
 
-    /// Dummy Bearer token sent in the Authorization header.
-    ///
-    /// Ollama ignores this value completely when running locally. We include
-    /// it so the request shape is structurally consistent with other providers
-    /// and so any HTTP debugging proxy does not flag a missing Authorization
-    /// header as anomalous.
-    private static let dummyBearerToken = "Bearer ollama"
-
-    /// Token ceiling matching OpenRouterAPI and the streaming Claude path.
+    /// Token ceiling (num_predict) matching the other providers.
     private static let maxTokens = 2048
 
     // MARK: - Session
@@ -130,20 +122,20 @@ class OllamaAPI {
 
         // MARK: Build request
 
-        var urlRequest = URLRequest(url: Self.chatCompletionsURL)
+        var urlRequest = URLRequest(url: Self.nativeChatURL)
         urlRequest.httpMethod = "POST"
-        // Mirror the per-request timeout from the session config. URLRequest
-        // timeoutInterval is the read-data timeout; the session-level value
-        // already covers this, but setting it here too makes the intent
-        // explicit and survives any future session reconfiguration.
+        // Read-data timeout mirrors the session config; explicit here for clarity.
         urlRequest.timeoutInterval = 180
-        // Dummy Bearer token — Ollama ignores it; included for structural consistency.
-        urlRequest.setValue(Self.dummyBearerToken, forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Intentionally omitting HTTP-Referer and X-Title — those are OpenRouter-
-        // specific attribution headers that Ollama does not recognise.
+        // No Authorization header — the native local endpoint requires none.
 
-        // MARK: Build messages array
+        // MARK: Build messages array (Ollama native /api/chat format)
+        //
+        // The native format differs from the OpenAI /v1 shape:
+        //   - images are a flat array of base64 strings on the message itself
+        //     (NO "data:image/jpeg;base64," prefix, no per-image image_url parts)
+        //   - content is a plain string, so each image's dimension label is
+        //     folded into the user text rather than sent as a separate part.
 
         var messages: [[String: Any]] = []
 
@@ -154,61 +146,50 @@ class OllamaAPI {
         ])
 
         // Conversation history as alternating text-only user/assistant pairs.
-        // Images are only in the final turn — same encoding used by OpenRouterAPI.
+        // Images only ride on the final turn.
         for (userPlaceholder, assistantResponse) in conversationHistory {
             messages.append(["role": "user", "content": userPlaceholder])
             messages.append(["role": "assistant", "content": assistantResponse])
         }
 
-        // Final user message: an array of content parts.
-        // Structure: text (prompt + optional supplemental context), then for
-        // each image: text label followed by the image_url part.
-        var finalUserContentParts: [[String: Any]] = []
-
-        // Combine userPrompt with supplementalContextText (if any) in a single
-        // text part — matching how OpenRouterAPI.analyzeImage assembles this.
-        let combinedUserText: String
+        // Fold the user prompt, optional AX inventory text, and each image's
+        // dimension label into one content string. The labels carry the pixel
+        // coordinate space so the model can place [POINT:x,y] correctly —
+        // preserving the label-before-image intent of the other providers.
+        var finalUserText = userPrompt
         if let supplementalContextText = supplementalContextText {
-            combinedUserText = userPrompt + "\n\n" + supplementalContextText
-        } else {
-            combinedUserText = userPrompt
+            finalUserText += "\n\n" + supplementalContextText
         }
-        finalUserContentParts.append([
-            "type": "text",
-            "text": combinedUserText
+        var imageBase64Strings: [String] = []
+        for image in images {
+            finalUserText += "\n\n" + image.label
+            imageBase64Strings.append(image.data.base64EncodedString())
+        }
+
+        messages.append([
+            "role": "user",
+            "content": finalUserText,
+            "images": imageBase64Strings
         ])
 
-        // Each image is preceded by its dimension label so the model knows the
-        // pixel coordinate space — mirroring the label-before-image pattern in
-        // ClaudeAPI.buildContentBlocks and OpenRouterAPI.analyzeImage.
-        for image in images {
-            finalUserContentParts.append([
-                "type": "text",
-                "text": image.label
-            ])
-            finalUserContentParts.append([
-                "type": "image_url",
-                "image_url": [
-                    "url": "data:image/jpeg;base64,\(image.data.base64EncodedString())"
-                ]
-            ])
-        }
-
-        messages.append(["role": "user", "content": finalUserContentParts])
-
         // MARK: Build request body
-
+        //
+        // think:false is the critical flag — it makes reasoning models (qwen3.5)
+        // answer directly into message.content instead of the thinking field
+        // (which Clicky never reads). stream:false returns one complete object.
         let requestBody: [String: Any] = [
             "model": model,
-            "max_tokens": Self.maxTokens,
-            "messages": messages
+            "think": false,
+            "stream": false,
+            "messages": messages,
+            "options": ["num_predict": Self.maxTokens]
         ]
 
         let requestBodyData = try JSONSerialization.data(withJSONObject: requestBody)
         urlRequest.httpBody = requestBodyData
 
         let payloadSizeInMegabytes = Double(requestBodyData.count) / 1_048_576.0
-        print("🦙 Ollama request: \(String(format: "%.1f", payloadSizeInMegabytes))MB, \(images.count) image(s), model: \(model)")
+        print("🦙 Ollama request: \(String(format: "%.1f", payloadSizeInMegabytes))MB, \(images.count) image(s), model: \(model), think:false")
 
         // MARK: Send request
 
@@ -259,15 +240,11 @@ class OllamaAPI {
 
         // MARK: Parse response
 
-        // Ollama's OpenAI-compat layer returns the same choices[0].message.content
-        // structure as OpenRouter. For reasoning models (e.g. qwen3.5:4b) the
-        // thinking trace is placed in a separate field; choices[0].message.content
-        // contains only the clean final answer with no <think> tags — parse it
-        // identically to how OpenRouterAPI parses its response.
+        // The native /api/chat non-stream response is a single object with a
+        // top-level `message` (NOT an OpenAI `choices` array). With think:false
+        // the final answer is in message.content; the thinking field is empty.
         guard let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let choicesArray = responseJSON["choices"] as? [[String: Any]],
-              let firstChoice = choicesArray.first,
-              let messageObject = firstChoice["message"] as? [String: Any],
+              let messageObject = responseJSON["message"] as? [String: Any],
               let responseText = messageObject["content"] as? String else {
             let rawResponseBody = String(data: responseData, encoding: .utf8) ?? "(unreadable)"
             throw NSError(
