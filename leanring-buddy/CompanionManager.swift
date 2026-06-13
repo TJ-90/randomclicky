@@ -1229,6 +1229,7 @@ final class CompanionManager: ObservableObject {
                 // "ollama" (local localhost:11434, no API key needed). When the file is
                 // absent or invalid, the default Claude path is used.
                 let llmProviderConfig = LLMProviderConfiguration.loadFromDisk()
+                appendDebugLog("LLM routing — provider=\(llmProviderConfig?.provider ?? "nil (default Claude)"), model=\(llmProviderConfig?.model ?? "-"), localVoice=\(llmProviderConfig?.localVoiceOutput ?? false)")
 
                 let fullResponseText: String
                 if let openRouterConfig = llmProviderConfig, openRouterConfig.usesOpenRouter {
@@ -1578,7 +1579,12 @@ final class CompanionManager: ObservableObject {
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                appendDebugLog("RESPONSE ERROR: \(error.localizedDescription) || raw: \(error)")
+                // Speak the REAL error (truncated) instead of the misleading
+                // "out of credits" message so failures are diagnosable from the
+                // app itself rather than masked behind one generic line.
+                speakTextLocally("Error. " + String(error.localizedDescription.prefix(140)))
+                voiceState = .responding
             }
 
             if !Task.isCancelled {
@@ -1701,6 +1707,27 @@ final class CompanionManager: ObservableObject {
     private func speakTextLocally(_ text: String) {
         localSpeechSynthesizer.stopSpeaking()
         localSpeechSynthesizer.startSpeaking(text)
+    }
+
+    /// Appends a timestamped diagnostic line to
+    /// ~/Library/Application Support/Clicky/clicky-debug.log so the real cause of
+    /// a response-pipeline failure is recoverable — the generic catch otherwise
+    /// masks every error behind one user-facing message.
+    private func appendDebugLog(_ message: String) {
+        guard let applicationSupportURL = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first else { return }
+        let directoryURL = applicationSupportURL.appendingPathComponent("Clicky", isDirectory: true)
+        let logURL = directoryURL.appendingPathComponent("clicky-debug.log")
+        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        guard let lineData = "[\(Date())] \(message)\n".data(using: .utf8) else { return }
+        if let fileHandle = try? FileHandle(forWritingTo: logURL) {
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(lineData)
+            try? fileHandle.close()
+        } else {
+            try? lineData.write(to: logURL)
+        }
     }
 
     /// Speaks a model reply. Local macOS voice when `localVoiceOutput` is set in
