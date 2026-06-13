@@ -1500,17 +1500,9 @@ final class CompanionManager: ObservableObject {
 
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
-                }
+                // speakResponse handles both the local-voice and ElevenLabs paths,
+                // including the empty-check and voiceState transition.
+                await speakResponse(spokenText)
 
                 // --- Post-TTS walkthrough step presentation (Phase C, U8) ---
                 // Wait for TTS to finish playing, then apply .stepPresented so the
@@ -1696,6 +1688,44 @@ final class CompanionManager: ObservableObject {
             iterationsElapsed += 1
         }
         return true
+    }
+
+    /// Stored synthesizer for local macOS voice output. Using a stored property
+    /// (rather than a local variable) prevents the synthesizer from being
+    /// deallocated mid-speech, which would silently cut off the audio.
+    private let localSpeechSynthesizer = NSSpeechSynthesizer()
+
+    /// Speaks `text` aloud locally with the macOS synthesizer. Used when local
+    /// voice output is configured, and as the fallback when ElevenLabs fails so
+    /// the user hears the REAL reply rather than a credits error.
+    private func speakTextLocally(_ text: String) {
+        localSpeechSynthesizer.stopSpeaking()
+        localSpeechSynthesizer.startSpeaking(text)
+    }
+
+    /// Speaks a model reply. Local macOS voice when `localVoiceOutput` is set in
+    /// llm.json (fully offline, no Worker); otherwise ElevenLabs with a local
+    /// fallback if it fails (e.g. Worker out of credits). Sets voiceState to
+    /// .responding once speech begins.
+    private func speakResponse(_ text: String) async {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+
+        if LLMProviderConfiguration.loadFromDisk()?.localVoiceOutput == true {
+            speakTextLocally(trimmedText)
+            voiceState = .responding
+            return
+        }
+
+        do {
+            try await elevenLabsTTSClient.speakText(trimmedText)
+            voiceState = .responding
+        } catch {
+            ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+            print("⚠️ ElevenLabs TTS error: \(error) — falling back to local voice")
+            speakTextLocally(trimmedText)
+            voiceState = .responding
+        }
     }
 
     /// Speaks a hardcoded error message using macOS system TTS when API
@@ -1990,14 +2020,7 @@ final class CompanionManager: ObservableObject {
                 case .done:
                     // Play TTS first so the user hears the result before the controller
                     // advances. The next step (if any) is handled by pendingWalkthroughStepAfterTTS.
-                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        do {
-                            try await elevenLabsTTSClient.speakText(spokenText)
-                            voiceState = .responding
-                        } catch {
-                            print("⚠️ Verification TTS error: \(error)")
-                        }
-                    }
+                    await speakResponse(spokenText)
                     // Capture the step number before the controller advances (it
                     // increments currentStepIndex on stepVerifiedDone).
                     let completedStepNumber = walkthroughController.currentSnapshot.currentStepIndex + 1
@@ -2036,14 +2059,7 @@ final class CompanionManager: ObservableObject {
                 case .retry(let hint):
                     // Speak the full response (hint already in spokenText after stripping).
                     // The speakRetryHint effect from the controller is informational here.
-                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        do {
-                            try await elevenLabsTTSClient.speakText(spokenText)
-                            voiceState = .responding
-                        } catch {
-                            print("⚠️ Verification retry TTS error: \(error)")
-                        }
-                    }
+                    await speakResponse(spokenText)
                     // Apply the retry and track analytics. newRetryCount is read from
                     // the snapshot AFTER the transition — the controller increments it.
                     walkthroughController.apply(event: .stepNeedsRetry(hint: hint))
@@ -2064,14 +2080,7 @@ final class CompanionManager: ObservableObject {
                     // No [VERIFY:...] tag found — graceful degradation path.
                     // Speak the response as a plain hint, then apply .turnInterrupted so
                     // the controller returns from .verifying to .awaitingUserAction.
-                    if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        do {
-                            try await elevenLabsTTSClient.speakText(spokenText)
-                            voiceState = .responding
-                        } catch {
-                            print("⚠️ Verification (no verdict) TTS error: \(error)")
-                        }
-                    }
+                    await speakResponse(spokenText)
                     walkthroughController.apply(event: .turnInterrupted)
                     print("📋 Walkthrough: no VERIFY tag — applied turnInterrupted (graceful degradation)")
                 }

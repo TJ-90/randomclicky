@@ -38,6 +38,9 @@ struct LLMProviderConfiguration {
     /// require one (e.g. Ollama running locally).
     let apiKey: String
     let model: String
+    /// When true, speak replies with the local macOS synthesizer instead of
+    /// ElevenLabs/Worker — lets voice output work fully offline.
+    let localVoiceOutput: Bool
 
     /// Returns true when the configured provider is OpenRouter.
     ///
@@ -126,10 +129,13 @@ struct LLMProviderConfiguration {
             return nil
         }
 
+        let localVoiceOutput = (jsonObject["localVoiceOutput"] as? Bool) ?? false
+
         return LLMProviderConfiguration(
             provider: trimmedProvider,
             apiKey: trimmedApiKey,
-            model: model.trimmingCharacters(in: .whitespacesAndNewlines)
+            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
+            localVoiceOutput: localVoiceOutput
         )
     }
 }
