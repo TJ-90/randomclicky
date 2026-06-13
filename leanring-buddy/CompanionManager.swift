@@ -340,6 +340,14 @@ final class CompanionManager: ObservableObject {
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
 
+        // If the local Ollama provider is configured, prewarm the model at launch
+        // so the user's first question gets warm (~6s) latency instead of the
+        // ~46s cold reload that otherwise makes the app look broken. Best-effort
+        // background load; failures are swallowed inside prewarm().
+        if let ollamaLaunchConfig = LLMProviderConfiguration.loadFromDisk(), ollamaLaunchConfig.usesOllama {
+            Task { await ollamaAPI.prewarm(model: ollamaLaunchConfig.model) }
+        }
+
         // Phase D (act mode, U11): confirmation-panel key-acquisition spike.
         // Only runs when `--confirmation-panel-spike` is in the launch arguments.
         // See ActionConfirmationPanel.swift for full spike instructions.
@@ -1269,6 +1277,8 @@ final class CompanionManager: ObservableObject {
                     fullResponseText = claudeResponseText
                 }
 
+                appendDebugLog("LLM RESPONSE OK — raw length=\(fullResponseText.count) chars, preview=\(fullResponseText.prefix(120))")
+
                 guard !Task.isCancelled else { return }
 
                 // --- Annotation parsing (Phase B, U5) ---
@@ -1736,9 +1746,13 @@ final class CompanionManager: ObservableObject {
     /// .responding once speech begins.
     private func speakResponse(_ text: String) async {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else { return }
+        guard !trimmedText.isEmpty else {
+            appendDebugLog("SPEAK SKIPPED — spoken text was empty after stripping (model returned only tags or whitespace)")
+            return
+        }
 
         if LLMProviderConfiguration.loadFromDisk()?.localVoiceOutput == true {
+            appendDebugLog("SPEAK local — len=\(trimmedText.count), synthesizing via NSSpeechSynthesizer")
             speakTextLocally(trimmedText)
             voiceState = .responding
             return

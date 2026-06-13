@@ -63,6 +63,12 @@ class OllamaAPI {
     /// gives the prompt plus the 2048-token response comfortable headroom.
     private static let contextWindowTokens = 16384
 
+    /// How long Ollama should keep the model resident in RAM after a request.
+    /// Sent as the top-level `keep_alive` field on every chat call and on the
+    /// launch-time prewarm. Avoids the ~46s cold-reload penalty for the duration
+    /// of a normal session.
+    private static let keepModelLoadedDuration = "30m"
+
     // MARK: - Session
 
     /// Single shared URLSession for all Ollama requests, with long timeouts.
@@ -189,6 +195,12 @@ class OllamaAPI {
             "model": model,
             "think": false,
             "stream": false,
+            // keep_alive holds the model in RAM after the call. Ollama's default is
+            // 5 minutes; once it unloads, the next request pays a ~46s cold reload
+            // (vs ~6s warm) on an M1 4.7B model — long enough that the user assumes
+            // the app is broken and gives up before it speaks. 30m keeps it resident
+            // across a normal session of back-to-back questions.
+            "keep_alive": Self.keepModelLoadedDuration,
             "messages": messages,
             "options": ["num_predict": Self.maxTokens, "num_ctx": Self.contextWindowTokens]
         ]
@@ -263,5 +275,36 @@ class OllamaAPI {
         }
 
         return responseText
+    }
+
+    // MARK: - Prewarm
+
+    /// Loads the model into RAM ahead of the first real request so the user's
+    /// first question gets the ~6s warm latency instead of the ~46s cold reload.
+    ///
+    /// Fires a minimal generate request (`prompt: ""`, no tokens generated) with
+    /// the same keep_alive used by real calls — Ollama interprets an empty
+    /// prompt as a pure load-the-model instruction. Best-effort: any failure
+    /// (Ollama not running, model not pulled) is swallowed silently because the
+    /// real call will surface a user-friendly error on its own. Safe to call at
+    /// launch on a background task.
+    func prewarm(model: String) async {
+        let prewarmURL = URL(string: "http://localhost:11434/api/generate")!
+        var urlRequest = URLRequest(url: prewarmURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = 180
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let requestBody: [String: Any] = [
+            "model": model,
+            "prompt": "",
+            "stream": false,
+            "keep_alive": Self.keepModelLoadedDuration
+        ]
+        guard let requestBodyData = try? JSONSerialization.data(withJSONObject: requestBody) else { return }
+        urlRequest.httpBody = requestBodyData
+
+        print("🦙 Ollama prewarm — loading \(model) into RAM")
+        _ = try? await session.data(for: urlRequest)
     }
 }
