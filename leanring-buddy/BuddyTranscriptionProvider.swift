@@ -34,6 +34,7 @@ enum BuddyTranscriptionProviderFactory {
         case assemblyAI = "assemblyai"
         case openAI = "openai"
         case appleSpeech = "apple"
+        case whisper = "whisper"
     }
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
@@ -50,6 +51,17 @@ enum BuddyTranscriptionProviderFactory {
 
         let assemblyAIProvider = AssemblyAIStreamingTranscriptionProvider()
         let openAIProvider = OpenAIAudioTranscriptionProvider()
+
+        if preferredProvider == .whisper {
+            let whisperProvider = WhisperBridgeTranscriptionProvider()
+            if whisperProvider.isConfigured {
+                return whisperProvider
+            }
+            // Whisper preferred but its config (python/script paths) is missing —
+            // fall back to Apple Speech rather than failing every recording.
+            print("⚠️ Transcription: local Whisper preferred but not configured, falling back to Apple Speech")
+            return AppleSpeechTranscriptionProvider()
+        }
 
         if preferredProvider == .appleSpeech {
             return AppleSpeechTranscriptionProvider()
