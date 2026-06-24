@@ -240,7 +240,6 @@ extension CompanionManager {
         )
 
         enqueueResolvedAction(action: action, resolvedElement: focusedElement)
-        voiceState = .idle
         print("⚡️ Act mode local type: queued focused-field TYPE without LLM")
         return true
     }

@@ -1089,6 +1089,7 @@ final class CompanionManager: ObservableObject {
 
             do {
                 if await tryHandleLocalFocusedTypeCommand(transcript: transcript) {
+                    voiceState = .idle
                     return
                 }
 
