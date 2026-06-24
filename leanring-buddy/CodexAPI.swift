@@ -202,6 +202,10 @@ final class CodexAPI {
 
         let stdinPipe = Pipe()
         process.standardInput = stdinPipe
+        let processExitSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            processExitSemaphore.signal()
+        }
 
         try process.run()
 
@@ -210,14 +214,12 @@ final class CodexAPI {
         }
         try? stdinPipe.fileHandleForWriting.close()
 
-        let deadline = Date().addingTimeInterval(configuration.codexTimeoutSeconds)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-
-        if process.isRunning {
+        let processExitResult = processExitSemaphore.wait(
+            timeout: .now() + configuration.codexTimeoutSeconds
+        )
+        if processExitResult == .timedOut {
             process.terminate()
-            Thread.sleep(forTimeInterval: 0.5)
+            _ = processExitSemaphore.wait(timeout: .now() + 0.5)
             throw NSError(
                 domain: "CodexAPI",
                 code: -2,
