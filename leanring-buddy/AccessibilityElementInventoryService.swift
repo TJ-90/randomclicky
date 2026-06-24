@@ -158,7 +158,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
 
     /// AX messaging timeout in seconds. Overrides the default (~6s per call)
     /// so one hung application cannot stall the entire walk.
-    static let axMessagingTimeoutInSeconds: Float = 1.0
+    nonisolated static let axMessagingTimeoutInSeconds: Float = 1.0
 
     /// Delay between the Electron/Chromium wake attempt and the re-walk, in
     /// seconds. Chromium builds its AX tree lazily; a short pause lets it
@@ -317,6 +317,34 @@ final class AccessibilityElementInventoryService: ObservableObject {
         }
     }
 
+    /// Captures only the frontmost app's focused editable element.
+    ///
+    /// This is a fast path for direct commands like "type hello". It avoids the
+    /// full window walk and screenshot capture, but only returns an element when
+    /// macOS explicitly reports a focused editable control. Callers still route
+    /// the result through Clicky's normal confirmation and execution safety chain.
+    func captureFocusedEditableElementForTyping() async -> AccessibleElement? {
+        guard let frontmostRunningApplication = NSWorkspace.shared.frontmostApplication else {
+            return nil
+        }
+
+        let frontmostAppProcessID = frontmostRunningApplication.processIdentifier
+        let primaryScreenFrameInAppKitCoordinates: CGRect = NSScreen.screens.first?.frame
+            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+
+        guard AXIsProcessTrusted() else {
+            return nil
+        }
+
+        return await performOnAXSerialQueue { [weak self] in
+            guard let self else { return nil }
+            return self.captureFocusedEditableElementOnAXThread(
+                processID: frontmostAppProcessID,
+                primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
+            )
+        }
+    }
+
     // MARK: - Pure static helpers (extracted for testability)
 
     /// Determines whether an element with the given role should be KEPT in the
@@ -333,7 +361,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
     ///     `kAXPressAction` via `AXUIElementCopyActionNames`. Any element that
     ///     is directly pressable is actionable regardless of role.
     /// - Returns: `true` if this element should be added to the inventory.
-    static func shouldKeepElement(role: String, elementExposesAXPressAction: Bool) -> Bool {
+    nonisolated static func shouldKeepElement(role: String, elementExposesAXPressAction: Bool) -> Bool {
         let actionableRoles: Set<String> = [
             "AXButton",
             "AXLink",
@@ -349,6 +377,22 @@ final class AccessibilityElementInventoryService: ObservableObject {
         return actionableRoles.contains(role) || elementExposesAXPressAction
     }
 
+    nonisolated static func isEditableElementForFocusedTyping(role: String, subrole: String?) -> Bool {
+        let lowercasedRole = role.lowercased()
+        let lowercasedSubrole = subrole?.lowercased() ?? ""
+        guard !lowercasedRole.contains("secure"),
+              !lowercasedSubrole.contains("secure") else {
+            return false
+        }
+
+        let editableRoles: Set<String> = [
+            "AXTextField",
+            "AXTextArea",
+            "AXComboBox"
+        ]
+        return editableRoles.contains(role)
+    }
+
     /// Determines whether BFS should descend into an element with the given role
     /// to look for actionable children.
     ///
@@ -359,7 +403,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
     ///
     /// - Parameter role: The AX role string.
     /// - Returns: `true` if BFS should visit this element's children.
-    static func shouldDescendIntoRole(_ role: String) -> Bool {
+    nonisolated static func shouldDescendIntoRole(_ role: String) -> Bool {
         // Elements we know are leaves and not containers — no point descending.
         let knownLeafRoles: Set<String> = [
             "AXStaticText",
@@ -385,7 +429,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
     ///
     /// - Parameter rawString: The raw string value from an AX attribute.
     /// - Returns: A sanitised string safe to embed in an inventory prompt line.
-    static func sanitiseTitleForPrompt(_ rawString: String) -> String {
+    nonisolated static func sanitiseTitleForPrompt(_ rawString: String) -> String {
         var result = rawString
         // Remove newlines and carriage returns
         result = result.replacingOccurrences(of: "\n", with: " ")
@@ -420,7 +464,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
     ///   - cgScreenBoundsForAllDisplays: The CG-space bounds of every connected
     ///     display. Pass `CGDisplayBounds(displayID)` for each display.
     /// - Returns: `true` if the frame is visible by the heuristic.
-    static func isElementFrameVisible(
+    nonisolated static func isElementFrameVisible(
         cgFrame: CGRect,
         windowCGFrame: CGRect,
         cgScreenBoundsForAllDisplays: [CGRect]
@@ -701,17 +745,121 @@ final class AccessibilityElementInventoryService: ObservableObject {
         return CGRect(origin: position, size: size)
     }
 
+    private nonisolated func getElementCGFrame(element: AXUIElement) -> CGRect? {
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+            return nil
+        }
+
+        guard let positionCFValue = positionValue,
+              let sizeCFValue = sizeValue,
+              CFGetTypeID(positionCFValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeCFValue) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let positionAXValue = unsafeBitCast(positionCFValue, to: AXValue.self)
+        let sizeAXValue = unsafeBitCast(sizeCFValue, to: AXValue.self)
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionAXValue, .cgPoint, &position),
+              AXValueGetValue(sizeAXValue, .cgSize, &size) else {
+            return nil
+        }
+
+        return CGRect(origin: position, size: size)
+    }
+
+    private nonisolated func copyStringAttribute(element: AXUIElement, attributeName: CFString) -> String {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attributeName, &value) == .success else {
+            return ""
+        }
+        return value as? String ?? ""
+    }
+
     // MARK: - Screen bounds
 
     /// Builds CG-coordinate bounds for every active display. Called once per
     /// walk and passed into the BFS so we avoid repeated CGDisplay queries in
     /// the hot loop.
-    private func buildCGScreenBoundsForAllDisplays() -> [CGRect] {
+    private nonisolated func buildCGScreenBoundsForAllDisplays() -> [CGRect] {
         var displayCount: UInt32 = 0
         CGGetActiveDisplayList(0, nil, &displayCount)
         var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
         CGGetActiveDisplayList(displayCount, &displayIDs, &displayCount)
         return displayIDs.map { CGDisplayBounds($0) }
+    }
+
+    private nonisolated func captureFocusedEditableElementOnAXThread(
+        processID: pid_t,
+        primaryScreenFrameInAppKitCoordinates: CGRect
+    ) -> AccessibleElement? {
+        let appElement = AXUIElementCreateApplication(processID)
+        AXUIElementSetMessagingTimeout(appElement, AccessibilityElementInventoryService.axMessagingTimeoutInSeconds)
+
+        var focusedElementValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElementValue
+        ) == .success,
+        let focusedElementObject = focusedElementValue,
+        CFGetTypeID(focusedElementObject) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let focusedElement = unsafeBitCast(focusedElementObject, to: AXUIElement.self)
+
+        let role = copyStringAttribute(element: focusedElement, attributeName: kAXRoleAttribute as CFString)
+        guard !role.isEmpty else { return nil }
+
+        let subrole = copyStringAttribute(element: focusedElement, attributeName: kAXSubroleAttribute as CFString)
+        guard AccessibilityElementInventoryService.isEditableElementForFocusedTyping(
+            role: role,
+            subrole: subrole.isEmpty ? nil : subrole
+        ) else {
+            return nil
+        }
+
+        guard let elementCGFrame = getElementCGFrame(element: focusedElement) else {
+            return nil
+        }
+
+        let cgScreenBoundsForAllDisplays = buildCGScreenBoundsForAllDisplays()
+        guard AccessibilityElementInventoryService.isElementFrameVisible(
+            cgFrame: elementCGFrame,
+            windowCGFrame: CGRect(x: -100_000, y: -100_000, width: 200_000, height: 200_000),
+            cgScreenBoundsForAllDisplays: cgScreenBoundsForAllDisplays
+        ) else {
+            return nil
+        }
+
+        let elementAppKitFrame = ScreenCoordinateConverter.convertCGGlobalRectToAppKitGlobalRect(
+            cgGlobalRect: elementCGFrame,
+            primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
+        )
+
+        let rawTitle = copyStringAttribute(element: focusedElement, attributeName: kAXTitleAttribute as CFString)
+        let rawDescription = copyStringAttribute(element: focusedElement, attributeName: kAXDescriptionAttribute as CFString)
+        let rawValue = copyStringAttribute(element: focusedElement, attributeName: kAXValueAttribute as CFString)
+        let unsanitisedTitle = !rawTitle.isEmpty
+            ? rawTitle
+            : (!rawDescription.isEmpty ? rawDescription : rawValue)
+
+        return AccessibleElement(
+            elementID: 1,
+            role: role,
+            subrole: subrole.isEmpty ? nil : subrole,
+            title: AccessibilityElementInventoryService.sanitiseTitleForPrompt(unsanitisedTitle),
+            cgFrame: elementCGFrame,
+            appKitFrame: elementAppKitFrame,
+            axElementHandle: focusedElement,
+            owningProcessID: processID
+        )
     }
 
     // MARK: - BFS walk result

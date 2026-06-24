@@ -88,6 +88,33 @@ struct ActionTagParserTests {
         #expect(!result.strippedText.contains("[TYPE:"))
     }
 
+    // MARK: - Local focused-type command parsing
+
+    @Test func localFocusedTypeCommandParsesDirectTypePhrase() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "type Hello Clicky")
+        #expect(textToType == "Hello Clicky")
+    }
+
+    @Test func localFocusedTypeCommandStripsMatchingQuotes() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "enter \"hello@example.com\"")
+        #expect(textToType == "hello@example.com")
+    }
+
+    @Test func localFocusedTypeCommandRejectsQuestions() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "what should I type here")
+        #expect(textToType == nil)
+    }
+
+    @Test func localFocusedTypeCommandRejectsBroadWritingRequests() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "write an email about tomorrow")
+        #expect(textToType == nil)
+    }
+
+    @Test func localFocusedTypeCommandRejectsControlCharacters() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "type hello\nthere")
+        #expect(textToType == nil)
+    }
+
     /// TYPE text containing colons: the LAST segment is the description.
     ///
     /// Split rule: description = LAST colon-segment; everything between the

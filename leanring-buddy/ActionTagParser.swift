@@ -377,3 +377,65 @@ enum ActionTagParser {
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+// MARK: - Local command parser
+
+/// Pure parser for simple act-mode commands Clicky can handle without an LLM.
+///
+/// This is intentionally narrow. It only recognizes direct focused-field type
+/// commands, because those can be grounded through macOS' focused UI element
+/// and still pass through Clicky's confirmation panel before execution.
+enum LocalActModeCommandParser {
+
+    static func parseFocusedTypeCommand(from transcript: String) -> String? {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty else { return nil }
+
+        let lowercasedTranscript = trimmedTranscript.lowercased()
+        let supportedPrefixes = [
+            "type ",
+            "enter "
+        ]
+
+        guard let matchedPrefix = supportedPrefixes.first(where: { lowercasedTranscript.hasPrefix($0) }) else {
+            return nil
+        }
+
+        let textStartIndex = trimmedTranscript.index(
+            trimmedTranscript.startIndex,
+            offsetBy: matchedPrefix.count
+        )
+        let rawTextToType = String(trimmedTranscript[textStartIndex...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let textToType = stripMatchingQuotes(from: rawTextToType)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !textToType.isEmpty else { return nil }
+        guard !textToType.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            return nil
+        }
+
+        return textToType
+    }
+
+    private static func stripMatchingQuotes(from text: String) -> String {
+        guard text.count >= 2,
+              let firstCharacter = text.first,
+              let lastCharacter = text.last else {
+            return text
+        }
+
+        let quotePairs: [(Character, Character)] = [
+            ("\"", "\""),
+            ("'", "'"),
+            ("“", "”"),
+            ("‘", "’")
+        ]
+
+        guard quotePairs.contains(where: { $0.0 == firstCharacter && $0.1 == lastCharacter }) else {
+            return text
+        }
+
+        return String(text.dropFirst().dropLast())
+    }
+}

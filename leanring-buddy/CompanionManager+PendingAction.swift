@@ -199,6 +199,52 @@ extension CompanionManager {
 
     // MARK: - Response pipeline integration
 
+    /// Handles simple focused-field type commands without invoking the LLM.
+    ///
+    /// This is deliberately narrow: only direct commands like "type hello" are
+    /// eligible, act mode must already be enabled, no walkthrough can be active,
+    /// and macOS must report a focused editable element. The resulting action
+    /// still goes through the normal confirmation panel and ActionExecutionService.
+    func tryHandleLocalFocusedTypeCommand(transcript: String) async -> Bool {
+        guard walkthroughController.phase == .inactive,
+              isActModeEnabled,
+              !ActionExecutionService.shared.isActionCurrentlyRunning,
+              let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: transcript) else {
+            return false
+        }
+
+        guard let focusedElement = await AccessibilityElementInventoryService.shared
+            .captureFocusedEditableElementForTyping() else {
+            return false
+        }
+
+        if !pendingActionStorage.pendingActionQueue.isEmpty {
+            pendingActionStorage.pendingActionQueue = []
+            pendingActionStorage.resolvedElementQueue = []
+            clearPendingActionHighlight()
+            print("⚠️ Act mode local type: stale queue cleared at turn boundary")
+        }
+
+        inventoryForCurrentInteraction = AccessibilityElementInventory(
+            elements: [focusedElement],
+            frontmostAppName: NSRunningApplication(processIdentifier: focusedElement.owningProcessID)?.localizedName ?? "",
+            frontmostAppBundleID: NSRunningApplication(processIdentifier: focusedElement.owningProcessID)?.bundleIdentifier ?? "",
+            captureOutcome: .captured
+        )
+
+        let action = ParsedElementAction(
+            kind: .type,
+            elementID: focusedElement.elementID,
+            textToType: textToType,
+            claudeDescription: "type into the focused field"
+        )
+
+        enqueueResolvedAction(action: action, resolvedElement: focusedElement)
+        voiceState = .idle
+        print("⚡️ Act mode local type: queued focused-field TYPE without LLM")
+        return true
+    }
+
     /// Called from `sendTranscriptToClaudeWithScreenshot` after the walkthrough
     /// tags have been stripped and before the POINT parser runs.
     ///

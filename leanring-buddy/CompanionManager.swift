@@ -1088,6 +1088,10 @@ final class CompanionManager: ObservableObject {
             voiceState = .processing
 
             do {
+                if await tryHandleLocalFocusedTypeCommand(transcript: transcript) {
+                    return
+                }
+
                 // Run screenshot capture and the AX element walk concurrently so
                 // neither blocks the other. The AX walk is raced against a 1.5s
                 // timeout: if it cannot finish in time this turn proceeds with NO

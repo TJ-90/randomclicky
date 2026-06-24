@@ -62,6 +62,38 @@ struct AccessibilityElementInventoryServiceTests {
         #expect(kept == true)
     }
 
+    @Test func focusedTypingAllowsTextFieldRole() {
+        let isEditable = AccessibilityElementInventoryService.isEditableElementForFocusedTyping(
+            role: "AXTextField",
+            subrole: nil
+        )
+        #expect(isEditable == true)
+    }
+
+    @Test func focusedTypingAllowsTextAreaRole() {
+        let isEditable = AccessibilityElementInventoryService.isEditableElementForFocusedTyping(
+            role: "AXTextArea",
+            subrole: nil
+        )
+        #expect(isEditable == true)
+    }
+
+    @Test func focusedTypingRejectsSecureSubrole() {
+        let isEditable = AccessibilityElementInventoryService.isEditableElementForFocusedTyping(
+            role: "AXTextField",
+            subrole: "AXSecureTextField"
+        )
+        #expect(isEditable == false)
+    }
+
+    @Test func focusedTypingRejectsButtons() {
+        let isEditable = AccessibilityElementInventoryService.isEditableElementForFocusedTyping(
+            role: "AXButton",
+            subrole: nil
+        )
+        #expect(isEditable == false)
+    }
+
     @Test func axCheckBoxRoleIsKept() {
         let kept = AccessibilityElementInventoryService.shouldKeepElement(
             role: "AXCheckBox",
