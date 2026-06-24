@@ -95,6 +95,16 @@ struct ActionTagParserTests {
         #expect(textToType == "Hello Clicky")
     }
 
+    @Test func localFocusedTypeCommandDropsTypeInFillerPhrase() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "type in Hello Clicky")
+        #expect(textToType == "Hello Clicky")
+    }
+
+    @Test func localFocusedTypeCommandPreservesQuotedTextStartingWithIn() {
+        let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "type \"in progress\"")
+        #expect(textToType == "in progress")
+    }
+
     @Test func localFocusedTypeCommandStripsMatchingQuotes() {
         let textToType = LocalActModeCommandParser.parseFocusedTypeCommand(from: "enter \"hello@example.com\"")
         #expect(textToType == "hello@example.com")

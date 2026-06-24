@@ -407,7 +407,11 @@ enum LocalActModeCommandParser {
         )
         let rawTextToType = String(trimmedTranscript[textStartIndex...])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let textToType = stripMatchingQuotes(from: rawTextToType)
+        let textToTypeWithFillerRemoved = dropLeadingFocusedFieldFiller(
+            from: rawTextToType,
+            matchedPrefix: matchedPrefix
+        )
+        let textToType = stripMatchingQuotes(from: textToTypeWithFillerRemoved)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !textToType.isEmpty else { return nil }
@@ -416,6 +420,25 @@ enum LocalActModeCommandParser {
         }
 
         return textToType
+    }
+
+    private static func dropLeadingFocusedFieldFiller(from text: String, matchedPrefix: String) -> String {
+        guard matchedPrefix == "type " else {
+            return text
+        }
+
+        let lowercasedText = text.lowercased()
+        let fillerPrefixes = [
+            "into ",
+            "in "
+        ]
+
+        guard let fillerPrefix = fillerPrefixes.first(where: { lowercasedText.hasPrefix($0) }) else {
+            return text
+        }
+
+        let contentStartIndex = text.index(text.startIndex, offsetBy: fillerPrefix.count)
+        return String(text[contentStartIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func stripMatchingQuotes(from text: String) -> String {
