@@ -149,6 +149,36 @@ struct leanring_buddyTests {
         #expect(codexPrompt.contains("Clicky will ask the user for explicit confirmation"))
     }
 
+    @Test func codexExecArgumentsDisableNonessentialFeaturesByDefault() {
+        let arguments = CodexAPI.buildExecArgumentsForTesting(
+            imageFileURLs: [],
+            finalMessageURL: URL(fileURLWithPath: "/tmp/clicky-response.txt"),
+            configuration: codexTestConfiguration(disableNonessentialFeatures: true)
+        )
+
+        #expect(arguments.starts(with: [
+            "--ask-for-approval", "never",
+            "--disable", "apps",
+            "--disable", "plugins",
+            "exec"
+        ]))
+    }
+
+    @Test func codexExecArgumentsCanKeepNonessentialFeaturesWhenConfigured() {
+        let arguments = CodexAPI.buildExecArgumentsForTesting(
+            imageFileURLs: [],
+            finalMessageURL: URL(fileURLWithPath: "/tmp/clicky-response.txt"),
+            configuration: codexTestConfiguration(disableNonessentialFeatures: false)
+        )
+
+        #expect(!arguments.contains("apps"))
+        #expect(!arguments.contains("plugins"))
+        #expect(arguments.starts(with: [
+            "--ask-for-approval", "never",
+            "exec"
+        ]))
+    }
+
     // MARK: - U12: Analytics payload privacy audit
 
     /// The action-event payload builder must NEVER include typed text.
@@ -187,6 +217,24 @@ struct leanring_buddyTests {
         #expect(payload["action_kind"] as? String == "click")
         #expect(payload["target_app_bundle_id"] as? String == "com.apple.Safari")
         #expect(payload.count == 2)
+    }
+
+    private func codexTestConfiguration(disableNonessentialFeatures: Bool) -> LLMProviderConfiguration {
+        LLMProviderConfiguration(
+            provider: "codex",
+            apiKey: "",
+            model: "gpt-5.3-codex-spark",
+            localVoiceOutput: true,
+            codexExecutablePath: "/usr/local/bin/codex",
+            codexWorkingDirectory: "/tmp",
+            codexUseOss: false,
+            codexLocalProvider: nil,
+            codexSandbox: "read-only",
+            codexShouldLoadUserConfig: false,
+            codexShouldLoadRules: false,
+            codexDisableNonessentialFeatures: disableNonessentialFeatures,
+            codexTimeoutSeconds: 45
+        )
     }
 
 }

@@ -30,7 +30,8 @@
 //      "provider": "codex",
 //      "model": "gpt-5.3-codex-spark",
 //      "codexExecutablePath": "/Users/you/.nvm/versions/node/v22.17.1/bin/codex",
-//      "codexTimeoutSeconds": 45
+//      "codexTimeoutSeconds": 45,
+//      "codexDisableNonessentialFeatures": true
 //    }
 //
 //    Codex CLI through local Ollama / open-source provider:
@@ -78,6 +79,10 @@ struct LLMProviderConfiguration {
     /// Whether Codex should load user/project execpolicy rules. Defaults false
     /// for screen-help turns that are not repository work.
     let codexShouldLoadRules: Bool
+    /// Whether Clicky should disable Codex apps/plugins for faster screen-help
+    /// turns. Clicky does not use Codex tool surfaces; actions execute through
+    /// Clicky's own confirmation-gated AX pipeline.
+    let codexDisableNonessentialFeatures: Bool
     /// Hard timeout for the local Codex process.
     let codexTimeoutSeconds: TimeInterval
 
@@ -196,6 +201,7 @@ struct LLMProviderConfiguration {
         }
         let codexShouldLoadUserConfig = (jsonObject["codexShouldLoadUserConfig"] as? Bool) ?? false
         let codexShouldLoadRules = (jsonObject["codexShouldLoadRules"] as? Bool) ?? false
+        let codexDisableNonessentialFeatures = (jsonObject["codexDisableNonessentialFeatures"] as? Bool) ?? true
         let codexTimeoutSeconds = (jsonObject["codexTimeoutSeconds"] as? Double) ?? 45
 
         return LLMProviderConfiguration(
@@ -210,6 +216,7 @@ struct LLMProviderConfiguration {
             codexSandbox: resolvedCodexSandbox,
             codexShouldLoadUserConfig: codexShouldLoadUserConfig,
             codexShouldLoadRules: codexShouldLoadRules,
+            codexDisableNonessentialFeatures: codexDisableNonessentialFeatures,
             codexTimeoutSeconds: max(5, codexTimeoutSeconds)
         )
     }

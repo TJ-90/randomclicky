@@ -66,6 +66,18 @@ final class CodexAPI {
         )
     }
 
+    static func buildExecArgumentsForTesting(
+        imageFileURLs: [URL],
+        finalMessageURL: URL,
+        configuration: LLMProviderConfiguration
+    ) -> [String] {
+        codexExecArguments(
+            imageFileURLs: imageFileURLs,
+            finalMessageURL: finalMessageURL,
+            configuration: configuration
+        )
+    }
+
     private static func buildCodexPrompt(
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)],
@@ -240,6 +252,16 @@ final class CodexAPI {
     ) -> [String] {
         var arguments: [String] = [
             "--ask-for-approval", "never",
+        ]
+
+        if configuration.codexDisableNonessentialFeatures {
+            arguments.append(contentsOf: [
+                "--disable", "apps",
+                "--disable", "plugins"
+            ])
+        }
+
+        arguments.append(contentsOf: [
             "exec",
             "--ephemeral",
             "--skip-git-repo-check",
@@ -247,7 +269,7 @@ final class CodexAPI {
             "--cd", configuration.codexWorkingDirectory ?? "/tmp",
             "-m", configuration.model,
             "-o", finalMessageURL.path
-        ]
+        ])
 
         if !configuration.codexShouldLoadUserConfig {
             arguments.append("--ignore-user-config")
