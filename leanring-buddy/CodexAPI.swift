@@ -50,6 +50,22 @@ final class CodexAPI {
 
     // MARK: - Prompt
 
+    static func buildPromptForTesting(
+        systemPrompt: String,
+        conversationHistory: [(userPlaceholder: String, assistantResponse: String)],
+        userPrompt: String,
+        supplementalContextText: String?,
+        imageLabels: [String]
+    ) -> String {
+        buildCodexPrompt(
+            systemPrompt: systemPrompt,
+            conversationHistory: conversationHistory,
+            userPrompt: userPrompt,
+            supplementalContextText: supplementalContextText,
+            imageLabels: imageLabels
+        )
+    }
+
     private static func buildCodexPrompt(
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)],

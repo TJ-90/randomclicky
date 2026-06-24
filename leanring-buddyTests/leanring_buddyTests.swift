@@ -121,6 +121,34 @@ struct leanring_buddyTests {
         #expect(promptOn.count > promptOff.count)
     }
 
+    @Test func codexPromptPreservesActModeOffInstruction() {
+        let codexPrompt = CodexAPI.buildPromptForTesting(
+            systemPrompt: CompanionManager.companionVoiceResponseSystemPrompt(actModeEnabled: false),
+            conversationHistory: [],
+            userPrompt: "type hello into the focused field",
+            supplementalContextText: "Current accessible elements:\nE3 text field",
+            imageLabels: ["current screen"]
+        )
+
+        #expect(codexPrompt.contains("act mode is off"))
+        #expect(codexPrompt.contains("they can enable act mode from the clicky panel"))
+        #expect(!codexPrompt.contains("[TYPE:E<id>"))
+    }
+
+    @Test func codexPromptPreservesActModeEnabledTypingGrammar() {
+        let codexPrompt = CodexAPI.buildPromptForTesting(
+            systemPrompt: CompanionManager.companionVoiceResponseSystemPrompt(actModeEnabled: true),
+            conversationHistory: [],
+            userPrompt: "type hello into the focused field",
+            supplementalContextText: "Current accessible elements:\nE3 text field",
+            imageLabels: ["current screen"]
+        )
+
+        #expect(codexPrompt.contains("act mode (enabled):"))
+        #expect(codexPrompt.contains("[TYPE:E<id>"))
+        #expect(codexPrompt.contains("Clicky will ask the user for explicit confirmation"))
+    }
+
     // MARK: - U12: Analytics payload privacy audit
 
     /// The action-event payload builder must NEVER include typed text.
