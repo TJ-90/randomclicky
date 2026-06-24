@@ -29,7 +29,7 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
-                modelPickerRow
+                modelInfoRow
                     .padding(.horizontal, 16)
             }
 
@@ -59,7 +59,7 @@ struct CompanionPanelView: View {
             // }
 
             // Act mode section — shown when the user has completed onboarding
-            // and all permissions are granted (same gate as the model picker).
+            // and all permissions are granted (same gate as the model row).
             // Hidden during an active walkthrough so the section list stays clean.
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
                 && companionManager.walkthroughController.phase == .inactive {
@@ -757,9 +757,9 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
-    // MARK: - Model Picker
+    // MARK: - Model
 
-    private var modelPickerRow: some View {
+    private var modelInfoRow: some View {
         HStack {
             Text("Model")
                 .font(.system(size: 13, weight: .medium))
@@ -767,10 +767,14 @@ struct CompanionPanelView: View {
 
             Spacer()
 
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
-            }
+            Text(companionManager.activeModelDisplayName)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .frame(maxWidth: 180, alignment: .trailing)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(Color.white.opacity(0.06))
@@ -781,25 +785,6 @@ struct CompanionPanelView: View {
             )
         }
         .padding(.vertical, 4)
-    }
-
-    private func modelOptionButton(label: String, modelID: String) -> some View {
-        let isSelected = companionManager.selectedModel == modelID
-        return Button(action: {
-            companionManager.setSelectedModel(modelID)
-        }) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
-                )
-        }
-        .buttonStyle(.plain)
-        .pointerCursor()
     }
 
     // MARK: - DM Farza Button

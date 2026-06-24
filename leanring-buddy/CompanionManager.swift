@@ -263,6 +263,10 @@ final class CompanionManager: ObservableObject {
     /// The Claude model used for voice responses. Persisted to UserDefaults.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
 
+    var activeModelDisplayName: String {
+        LLMProviderConfiguration.loadFromDisk()?.model ?? selectedModel
+    }
+
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
