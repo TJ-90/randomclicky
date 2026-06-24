@@ -58,7 +58,7 @@ jobs:
             -derivedDataPath ./DerivedDataApp \
             $SIGNING_FLAGS
 
-      - name: Re-sign app with stable self-signed identity
+      - name: Re-sign app with stable self-signed identity when configured
         env:
           P12_BASE64: ${{ secrets.CLICKY_SIGNING_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.CLICKY_SIGNING_P12_PASSWORD }}
@@ -68,6 +68,11 @@ jobs:
           set -euo pipefail
           APP_PATH="./DerivedDataApp/Build/Products/Debug/Clicky.app"
           KEYCHAIN="$RUNNER_TEMP/clicky-signing.keychain-db"
+          if [[ -z "${P12_BASE64:-}" || -z "${P12_PASSWORD:-}" || -z "${KEYCHAIN_PASSWORD:-}" ]]; then
+            echo "Signing secrets are not configured; keeping the ad-hoc signature from the build step."
+            codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE 'Authority|Identifier|Signature|flags' || true
+            exit 0
+          fi
           # Import the self-signed cert into a temp keychain so every build is signed
           # with the SAME identity -> macOS treats rebuilds as the same app, and TCC
           # permission grants (Accessibility, Screen Recording) persist across builds.
