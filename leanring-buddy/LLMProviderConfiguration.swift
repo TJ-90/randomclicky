@@ -25,6 +25,22 @@
 //    }
 //    The "apiKey" field is optional for Ollama and ignored at runtime.
 //
+//    Codex CLI (local command; uses saved Codex auth):
+//    {
+//      "provider": "codex",
+//      "model": "gpt-5.3-codex-spark",
+//      "codexExecutablePath": "/Users/you/.nvm/versions/node/v22.17.1/bin/codex",
+//      "codexTimeoutSeconds": 45
+//    }
+//
+//    Codex CLI through local Ollama / open-source provider:
+//    {
+//      "provider": "codex",
+//      "model": "gpt-oss:20b",
+//      "codexUseOss": true,
+//      "codexLocalProvider": "ollama"
+//    }
+//
 //  When the file is absent, unreadable, or contains invalid JSON the loader
 //  returns nil and the app falls back to the default Claude-via-Worker path.
 //  It never crashes on a bad file.
@@ -41,6 +57,29 @@ struct LLMProviderConfiguration {
     /// When true, speak replies with the local macOS synthesizer instead of
     /// ElevenLabs/Worker — lets voice output work fully offline.
     let localVoiceOutput: Bool
+    /// Optional absolute path to the Codex CLI binary. GUI apps do not inherit
+    /// the user's shell PATH, so this lets nvm/homebrew installs be addressed
+    /// directly when auto-discovery cannot find them.
+    let codexExecutablePath: String?
+    /// Directory Codex should run from. Defaults to /tmp so Clicky screen-help
+    /// turns do not accidentally load repository instructions or edit files.
+    let codexWorkingDirectory: String?
+    /// When true, pass --oss to Codex so it uses an open-source/local provider.
+    let codexUseOss: Bool
+    /// Optional local provider value for Codex's --local-provider flag, such as
+    /// "ollama" or "lmstudio".
+    let codexLocalProvider: String?
+    /// Sandbox policy passed to Codex exec. Defaults to read-only because Clicky
+    /// performs screen actions through its own confirmation-gated AX executor.
+    let codexSandbox: String
+    /// Whether Codex should load ~/.codex/config.toml. Defaults false for speed
+    /// and predictability; set true if you rely on Codex config profiles/tools.
+    let codexShouldLoadUserConfig: Bool
+    /// Whether Codex should load user/project execpolicy rules. Defaults false
+    /// for screen-help turns that are not repository work.
+    let codexShouldLoadRules: Bool
+    /// Hard timeout for the local Codex process.
+    let codexTimeoutSeconds: TimeInterval
 
     /// Returns true when the configured provider is OpenRouter.
     ///
@@ -59,6 +98,14 @@ struct LLMProviderConfiguration {
     /// "ollama" both match.
     var usesOllama: Bool {
         provider.lowercased() == "ollama"
+    }
+
+    /// Returns true when the configured provider is Codex CLI.
+    ///
+    /// Codex is invoked as a local process using the user's existing Codex auth.
+    /// It is keyless from Clicky's point of view, like Ollama.
+    var usesCodex: Bool {
+        provider.lowercased() == "codex"
     }
 
     /// Reads and decodes the local llm.json config file.
@@ -118,24 +165,52 @@ struct LLMProviderConfiguration {
         // apiKey handling is provider-dependent:
         //   - openrouter: required, must be non-empty (empty key → silent 401s)
         //   - ollama:     optional, ignored at runtime (local server, no auth)
+        //   - codex:      optional, uses saved Codex CLI auth or local OSS provider
         //   - unknown:    treat like openrouter and require a key so we fail
         //                 loudly rather than sending keyless requests
         let rawApiKey = jsonObject["apiKey"] as? String ?? ""
         let trimmedApiKey = rawApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let providerRequiresApiKey = trimmedProvider.lowercased() != "ollama"
+        let keylessProviders: Set<String> = ["ollama", "codex"]
+        let providerRequiresApiKey = !keylessProviders.contains(trimmedProvider.lowercased())
         if providerRequiresApiKey && trimmedApiKey.isEmpty {
             print("⚠️ LLMProviderConfiguration: llm.json apiKey is empty for provider '\(trimmedProvider)' — falling back to default provider")
             return nil
         }
 
         let localVoiceOutput = (jsonObject["localVoiceOutput"] as? Bool) ?? false
+        let codexExecutablePath = (jsonObject["codexExecutablePath"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let codexWorkingDirectory = (jsonObject["codexWorkingDirectory"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let codexUseOss = (jsonObject["codexUseOss"] as? Bool) ?? false
+        let codexLocalProvider = (jsonObject["codexLocalProvider"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let codexSandbox = (jsonObject["codexSandbox"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedCodexSandbox: String
+        if let codexSandbox, !codexSandbox.isEmpty {
+            resolvedCodexSandbox = codexSandbox
+        } else {
+            resolvedCodexSandbox = "read-only"
+        }
+        let codexShouldLoadUserConfig = (jsonObject["codexShouldLoadUserConfig"] as? Bool) ?? false
+        let codexShouldLoadRules = (jsonObject["codexShouldLoadRules"] as? Bool) ?? false
+        let codexTimeoutSeconds = (jsonObject["codexTimeoutSeconds"] as? Double) ?? 45
 
         return LLMProviderConfiguration(
             provider: trimmedProvider,
             apiKey: trimmedApiKey,
             model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            localVoiceOutput: localVoiceOutput
+            localVoiceOutput: localVoiceOutput,
+            codexExecutablePath: codexExecutablePath?.isEmpty == true ? nil : codexExecutablePath,
+            codexWorkingDirectory: codexWorkingDirectory?.isEmpty == true ? nil : codexWorkingDirectory,
+            codexUseOss: codexUseOss,
+            codexLocalProvider: codexLocalProvider?.isEmpty == true ? nil : codexLocalProvider,
+            codexSandbox: resolvedCodexSandbox,
+            codexShouldLoadUserConfig: codexShouldLoadUserConfig,
+            codexShouldLoadRules: codexShouldLoadRules,
+            codexTimeoutSeconds: max(5, codexTimeoutSeconds)
         )
     }
 }

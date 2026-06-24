@@ -147,8 +147,7 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+    private let responseOverlayManager = CompanionResponseOverlayManager()
 
     /// Walkthrough step state machine for Phase C (guided walkthroughs).
     ///
@@ -218,6 +217,16 @@ final class CompanionManager: ObservableObject {
         return OllamaAPI()
     }()
 
+    /// Codex CLI bridge, allocated once on first use.
+    ///
+    /// Only touched when ~/Library/Application Support/Clicky/llm.json is
+    /// present and specifies "codex" as the provider. Codex proposes text and
+    /// Clicky tags; Clicky's existing parsers, confirmation UI, and AX executor
+    /// still own every screen action.
+    private lazy var codexAPI: CodexAPI = {
+        return CodexAPI()
+    }()
+
     // Internal (not private): the CompanionManager+PendingAction extension lives in a
     // separate file and speaks action outcomes through this client.
     lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -279,6 +288,7 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         } else {
             overlayWindowManager.hideOverlay()
+            responseOverlayManager.hideOverlay()
             isOverlayVisible = false
         }
     }
@@ -810,6 +820,7 @@ final class CompanionManager: ObservableObject {
             let walkthroughPhaseBeforeCancel = walkthroughController.phase
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
+            responseOverlayManager.hideOverlay()
             clearDetectedElementLocation()
 
             // After cancelling, notify the controller so it does not get stranded
@@ -1233,9 +1244,9 @@ final class CompanionManager: ObservableObject {
                 // Provider switch: if the user has placed a local llm.json config at
                 // ~/Library/Application Support/Clicky/llm.json, route this vision request
                 // through the appropriate client instead of the default Claude-via-Worker
-                // path. Supported providers: "openrouter" (remote, API key required) and
-                // "ollama" (local localhost:11434, no API key needed). When the file is
-                // absent or invalid, the default Claude path is used.
+                // path. Supported providers: "openrouter" (remote, API key required),
+                // "ollama" (local localhost:11434), and "codex" (local Codex CLI).
+                // When the file is absent or invalid, the default Claude path is used.
                 let llmProviderConfig = LLMProviderConfiguration.loadFromDisk()
                 appendDebugLog("LLM routing — provider=\(llmProviderConfig?.provider ?? "nil (default Claude)"), model=\(llmProviderConfig?.model ?? "-"), localVoice=\(llmProviderConfig?.localVoiceOutput ?? false)")
 
@@ -1261,6 +1272,17 @@ final class CompanionManager: ObservableObject {
                         userPrompt: transcript,
                         supplementalContextText: supplementalInventoryTextBlock,
                         model: ollamaConfig.model
+                    )
+                } else if let codexConfig = llmProviderConfig, codexConfig.usesCodex {
+                    // Local Codex path — invokes `codex exec` with screenshots attached.
+                    print("🧠 Using Codex provider — model: \(codexConfig.model)")
+                    fullResponseText = try await codexAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: effectiveSystemPrompt,
+                        conversationHistory: historyForAPI,
+                        userPrompt: transcript,
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        configuration: codexConfig
                     )
                 } else {
                     // Default path: Claude via Cloudflare Worker proxy (streaming).
@@ -1751,6 +1773,10 @@ final class CompanionManager: ObservableObject {
             return
         }
 
+        responseOverlayManager.showOverlayAndBeginStreaming()
+        responseOverlayManager.updateStreamingText(trimmedText)
+        responseOverlayManager.finishStreaming()
+
         if LLMProviderConfiguration.loadFromDisk()?.localVoiceOutput == true {
             appendDebugLog("SPEAK local — len=\(trimmedText.count), synthesizing via NSSpeechSynthesizer")
             speakTextLocally(trimmedText)
@@ -1923,8 +1949,9 @@ final class CompanionManager: ObservableObject {
                 //
                 // Provider switch: same logic as sendTranscriptToClaudeWithScreenshot —
                 // use OpenRouter when llm.json specifies "openrouter", Ollama when it
-                // specifies "ollama", or fall back to Claude. Walkthroughs use the same
-                // locally-configured vision model as normal turns for consistency.
+                // specifies "ollama", Codex when it specifies "codex", or fall back to
+                // Claude. Walkthroughs use the same locally-configured vision model as
+                // normal turns for consistency.
                 let verificationLLMProviderConfig = LLMProviderConfiguration.loadFromDisk()
 
                 let fullResponseText: String
@@ -1951,6 +1978,18 @@ final class CompanionManager: ObservableObject {
                         userPrompt: "please verify whether I completed the current step",
                         supplementalContextText: supplementalInventoryTextBlock,
                         model: ollamaVerificationConfig.model
+                    )
+                } else if let codexVerificationConfig = verificationLLMProviderConfig,
+                          codexVerificationConfig.usesCodex {
+                    // Local Codex path — invokes `codex exec` with screenshots attached.
+                    print("🧠 Walkthrough verification using Codex provider — model: \(codexVerificationConfig.model)")
+                    fullResponseText = try await codexAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: verificationSystemPrompt,
+                        conversationHistory: [],
+                        userPrompt: "please verify whether I completed the current step",
+                        supplementalContextText: supplementalInventoryTextBlock,
+                        configuration: codexVerificationConfig
                     )
                 } else {
                     // Default path: Claude via Cloudflare Worker proxy (streaming).
