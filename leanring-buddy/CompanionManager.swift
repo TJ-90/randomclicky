@@ -1015,12 +1015,15 @@ final class CompanionManager: ObservableObject {
     - every action requires user confirmation. never assume confirmation.
     - never type into password fields (AXSecureTextField). if the target is a secure field, describe what to do instead.
     - never include newlines or control characters in TYPE text — only plain text the user can read in the preview.
+    - if the user asks you to edit, rewrite, replace, correct, or insert text in the current document, and the interactive-elements inventory contains a focused editable text field or text area, emit a TYPE tag for that editable element. don't merely recite the edited text unless there is no editable target or the edit needs unsupported multiline text.
+    - for document edits, the TYPE payload should be the exact text to place into the editable target. if preserving multiple paragraphs would require newlines, explain that limitation instead of emitting a TYPE tag.
     - keep descriptions honest and brief: "click Save" not "click the big important Save button".
     - if the inventory is absent or the target element isn't in it, describe the action in words instead of emitting a tag.
 
     examples:
     - user says "click save for me": "got it. [CLICK:E5:click Save button]"
     - user says "fill in my name": "filling that in. [TYPE:E3:Jane Smith:type name into Name field]"
+    - user says "fix the grammar in this note": "i'll replace the focused note text. [TYPE:E4:Today is the third day after the miscarriage, and I do not feel much.:replace focused note text]"
     - user says "submit the form": "on it. [TYPE:E2:Jane Smith:fill Name] [TYPE:E4:jane@example.com:fill Email] then [CLICK:E7:click Submit]"
     """
 

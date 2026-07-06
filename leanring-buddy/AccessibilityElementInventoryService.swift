@@ -776,8 +776,37 @@ final class AccessibilityElementInventoryService: ObservableObject {
             )
         }
 
-        let keptElements = walkedElements.keptElements
-        let visibleTextItems = walkedElements.visibleTextItems
+        var keptElements = walkedElements.keptElements
+        var visibleTextItems = walkedElements.visibleTextItems
+
+        let nextFocusedElementID = (keptElements.map(\.elementID).max() ?? 0) + 1
+        if let focusedEditableElement = captureFocusedEditableElementSnapshotOnAXThread(
+            processID: processID,
+            primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates,
+            elementID: nextFocusedElementID
+        ) {
+            let focusedElementIsAlreadyInInventory = keptElements.contains { existingElement in
+                CFEqual(existingElement.axElementHandle, focusedEditableElement.element.axElementHandle)
+                    || (existingElement.role == focusedEditableElement.element.role
+                        && existingElement.cgFrame.equalTo(focusedEditableElement.element.cgFrame))
+            }
+
+            if !focusedElementIsAlreadyInInventory {
+                keptElements.append(focusedEditableElement.element)
+            }
+
+            if let focusedVisibleTextItem = focusedEditableElement.visibleTextItem {
+                let focusedTextIsAlreadyInContext = visibleTextItems.contains { existingTextItem in
+                    existingTextItem.role == focusedVisibleTextItem.role
+                        && existingTextItem.text == focusedVisibleTextItem.text
+                        && existingTextItem.cgFrame.equalTo(focusedVisibleTextItem.cgFrame)
+                }
+
+                if !focusedTextIsAlreadyInContext {
+                    visibleTextItems.append(focusedVisibleTextItem)
+                }
+            }
+        }
 
         if keptElements.isEmpty && visibleTextItems.isEmpty && walkedElements.totalVisitedCount == 0 {
             return AccessibilityElementInventory(
@@ -933,6 +962,23 @@ final class AccessibilityElementInventoryService: ObservableObject {
         processID: pid_t,
         primaryScreenFrameInAppKitCoordinates: CGRect
     ) -> AccessibleElement? {
+        return captureFocusedEditableElementSnapshotOnAXThread(
+            processID: processID,
+            primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates,
+            elementID: 1
+        )?.element
+    }
+
+    private struct FocusedEditableElementSnapshot {
+        let element: AccessibleElement
+        let visibleTextItem: AccessibleTextContent?
+    }
+
+    private nonisolated func captureFocusedEditableElementSnapshotOnAXThread(
+        processID: pid_t,
+        primaryScreenFrameInAppKitCoordinates: CGRect,
+        elementID: Int
+    ) -> FocusedEditableElementSnapshot? {
         let appElement = AXUIElementCreateApplication(processID)
         AXUIElementSetMessagingTimeout(appElement, AccessibilityElementInventoryService.axMessagingTimeoutInSeconds)
 
@@ -984,8 +1030,8 @@ final class AccessibilityElementInventoryService: ObservableObject {
             ? rawTitle
             : (!rawDescription.isEmpty ? rawDescription : rawValue)
 
-        return AccessibleElement(
-            elementID: 1,
+        let accessibleElement = AccessibleElement(
+            elementID: elementID,
             role: role,
             subrole: subrole.isEmpty ? nil : subrole,
             title: AccessibilityElementInventoryService.sanitiseTitleForPrompt(unsanitisedTitle),
@@ -993,6 +1039,21 @@ final class AccessibilityElementInventoryService: ObservableObject {
             appKitFrame: elementAppKitFrame,
             axElementHandle: focusedElement,
             owningProcessID: processID
+        )
+
+        let visibleText = AccessibilityElementInventoryService.sanitiseVisibleTextForPrompt(unsanitisedTitle)
+        let visibleTextItem = visibleText.isEmpty
+            ? nil
+            : AccessibleTextContent(
+                role: role,
+                text: visibleText,
+                cgFrame: elementCGFrame,
+                appKitFrame: elementAppKitFrame
+            )
+
+        return FocusedEditableElementSnapshot(
+            element: accessibleElement,
+            visibleTextItem: visibleTextItem
         )
     }
 

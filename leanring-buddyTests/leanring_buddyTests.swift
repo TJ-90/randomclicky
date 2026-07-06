@@ -106,6 +106,17 @@ struct leanring_buddyTests {
         #expect(promptWithActModeOn.contains("[TYPE:E<id>"))
     }
 
+    @Test func systemPromptTellsActModeToEditFocusedDocumentTextWithTypeTag() {
+        let promptWithActModeOn = CompanionManager.companionVoiceResponseSystemPrompt(
+            actModeEnabled: true
+        )
+
+        #expect(promptWithActModeOn.contains("edit, rewrite, replace, correct, or insert text"))
+        #expect(promptWithActModeOn.contains("focused editable text field or text area"))
+        #expect(promptWithActModeOn.contains("fix the grammar in this note"))
+        #expect(promptWithActModeOn.contains("[TYPE:E4:Today is the third day after the miscarriage"))
+    }
+
     /// The base prompt (walkthrough grammar, pointing rules, etc.) must be
     /// present in BOTH variants — act mode gating should only ADD content,
     /// never remove existing functionality.
