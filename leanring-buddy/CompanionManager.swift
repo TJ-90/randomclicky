@@ -48,10 +48,20 @@ final class CompanionManager: ObservableObject {
     /// Whether Clicky should speak model replies aloud. When disabled, replies
     /// still appear in the overlay and action tags are still processed, but no
     /// ElevenLabs/local TTS is started for normal responses.
-    @Published var isSpokenResponsesEnabled: Bool =
-        UserDefaults.standard.object(forKey: "spokenResponsesEnabled") == nil
-            ? true
-            : UserDefaults.standard.bool(forKey: "spokenResponsesEnabled")
+    @Published var isSpokenResponsesEnabled: Bool = CompanionManager.resolvedSpokenResponsesEnabled(
+        userDefaultsValueExists: UserDefaults.standard.object(forKey: "spokenResponsesEnabled") != nil,
+        storedValue: UserDefaults.standard.bool(forKey: "spokenResponsesEnabled")
+    )
+
+    static func resolvedSpokenResponsesEnabled(
+        userDefaultsValueExists: Bool,
+        storedValue: Bool
+    ) -> Bool {
+        guard userDefaultsValueExists else {
+            return true
+        }
+        return storedValue
+    }
 
     /// Sets act mode on or off and persists the choice to UserDefaults.
     ///

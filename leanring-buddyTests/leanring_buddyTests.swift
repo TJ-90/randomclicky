@@ -117,6 +117,29 @@ struct leanring_buddyTests {
         #expect(promptWithActModeOn.contains("[TYPE:E4:Today is the third day after the miscarriage"))
     }
 
+    @Test func spokenResponsesPreferenceDefaultsToEnabledWhenNoStoredValueExists() {
+        let isEnabled = CompanionManager.resolvedSpokenResponsesEnabled(
+            userDefaultsValueExists: false,
+            storedValue: false
+        )
+
+        #expect(isEnabled == true)
+    }
+
+    @Test func spokenResponsesPreferenceUsesStoredValueWhenOneExists() {
+        let disabledValue = CompanionManager.resolvedSpokenResponsesEnabled(
+            userDefaultsValueExists: true,
+            storedValue: false
+        )
+        let enabledValue = CompanionManager.resolvedSpokenResponsesEnabled(
+            userDefaultsValueExists: true,
+            storedValue: true
+        )
+
+        #expect(disabledValue == false)
+        #expect(enabledValue == true)
+    }
+
     /// The base prompt (walkthrough grammar, pointing rules, etc.) must be
     /// present in BOTH variants — act mode gating should only ADD content,
     /// never remove existing functionality.
