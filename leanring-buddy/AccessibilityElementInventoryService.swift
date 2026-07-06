@@ -75,6 +75,26 @@ struct AccessibleElement {
     let owningProcessID: pid_t
 }
 
+/// A single readable text fragment discovered during an AX walk.
+///
+/// These items are prompt context only. They are deliberately not assigned
+/// element IDs and are never used by the action executor.
+struct AccessibleTextContent {
+    /// The AX role string (for example, "AXStaticText" or "AXLink").
+    let role: String
+
+    /// Sanitised visible text for the element. This can be longer than an
+    /// actionable element title because document text needs enough context for
+    /// the model to understand what is on screen.
+    let text: String
+
+    /// The text element's bounding rect in CG global coordinates.
+    let cgFrame: CGRect
+
+    /// The text element's bounding rect in AppKit global coordinates.
+    let appKitFrame: CGRect
+}
+
 /// Describes why a walk produced no elements, distinguishable so analytics can
 /// separate timeouts (which benefit from the background-completion path) from
 /// empty trees (which indicate a stub tree or AX-less app).
@@ -104,6 +124,10 @@ struct AccessibilityElementInventory {
     /// Actionable elements discovered in traversal order, E1…En.
     let elements: [AccessibleElement]
 
+    /// Visible readable text discovered in the same walk. These entries provide
+    /// page/document context but are not clickable/actionable IDs.
+    let visibleTextItems: [AccessibleTextContent]
+
     /// The localized display name of the frontmost application at the time of
     /// the walk (e.g. "Safari"). Empty string if the walk failed before
     /// identifying an app.
@@ -116,12 +140,27 @@ struct AccessibilityElementInventory {
     /// Why the walk produced its result. Use this to decide whether to log a
     /// timeout event, show a "no AX data" fallback, or surface a permission hint.
     let captureOutcome: AccessibilityInventoryCaptureOutcome
+
+    init(
+        elements: [AccessibleElement],
+        visibleTextItems: [AccessibleTextContent] = [],
+        frontmostAppName: String,
+        frontmostAppBundleID: String,
+        captureOutcome: AccessibilityInventoryCaptureOutcome
+    ) {
+        self.elements = elements
+        self.visibleTextItems = visibleTextItems
+        self.frontmostAppName = frontmostAppName
+        self.frontmostAppBundleID = frontmostAppBundleID
+        self.captureOutcome = captureOutcome
+    }
 }
 
 // MARK: - Service
 
-/// Captures a bounded, non-blocking inventory of actionable UI elements in the
-/// frontmost window. All AX work runs on a single dedicated serial queue.
+/// Captures a bounded, non-blocking inventory of actionable UI elements and
+/// readable text in the frontmost window. All AX work runs on a single
+/// dedicated serial queue.
 ///
 /// Usage:
 /// ```swift
@@ -377,6 +416,30 @@ final class AccessibilityElementInventoryService: ObservableObject {
         return actionableRoles.contains(role) || elementExposesAXPressAction
     }
 
+    /// Determines whether an element should be captured as visible text context.
+    ///
+    /// This is intentionally separate from `shouldKeepElement`: document text
+    /// should help the model read the page, but it must not become an element ID
+    /// that the action pipeline might treat as clickable.
+    nonisolated static func shouldCaptureVisibleText(role: String, subrole: String? = nil) -> Bool {
+        let lowercasedRole = role.lowercased()
+        let lowercasedSubrole = subrole?.lowercased() ?? ""
+        guard !lowercasedRole.contains("secure"),
+              !lowercasedSubrole.contains("secure") else {
+            return false
+        }
+
+        let readableRoles: Set<String> = [
+            "AXStaticText",
+            "AXHeading",
+            "AXLink",
+            "AXTextField",
+            "AXTextArea",
+            "AXComboBox"
+        ]
+        return readableRoles.contains(role)
+    }
+
     nonisolated static func isEditableElementForFocusedTyping(role: String, subrole: String?) -> Bool {
         let lowercasedRole = role.lowercased()
         let lowercasedSubrole = subrole?.lowercased() ?? ""
@@ -445,6 +508,26 @@ final class AccessibilityElementInventoryService: ObservableObject {
         // Truncate long titles
         if result.count > 80 {
             result = String(result.prefix(80))
+        }
+        return result
+    }
+
+    /// Sanitises visible page text for prompt context.
+    ///
+    /// Unlike actionable element titles, this keeps a larger character budget so
+    /// paragraph text from document apps is not reduced to a misleading snippet.
+    nonisolated static func sanitiseVisibleTextForPrompt(_ rawString: String) -> String {
+        var result = rawString
+        result = result.replacingOccurrences(of: "\n", with: " ")
+        result = result.replacingOccurrences(of: "\r", with: " ")
+        result = result.replacingOccurrences(of: "[", with: "")
+        result = result.replacingOccurrences(of: "]", with: "")
+        while result.contains("  ") {
+            result = result.replacingOccurrences(of: "  ", with: " ")
+        }
+        result = result.trimmingCharacters(in: .whitespaces)
+        if result.count > 500 {
+            result = String(result.prefix(500))
         }
         return result
     }
@@ -561,6 +644,55 @@ final class AccessibilityElementInventoryService: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    /// Formats visible page text as prompt context without assigning action IDs.
+    ///
+    /// Text is ordered top-to-bottom, then left-to-right in screenshot-pixel
+    /// space so document content reads naturally to the model.
+    static func formatVisibleTextForPrompt(
+        visibleTextItems: [AccessibleTextContent],
+        screenshotWidthInPixels: Int,
+        screenshotHeightInPixels: Int,
+        displayFrameInAppKitCoordinates: CGRect,
+        maximumTextItemCount: Int = 80
+    ) -> String {
+        guard !visibleTextItems.isEmpty else { return "" }
+
+        let formattedTextItems = visibleTextItems.compactMap { textItem -> (line: String, y: Int, x: Int)? in
+            let sanitisedText = sanitiseVisibleTextForPrompt(textItem.text)
+            guard !sanitisedText.isEmpty else { return nil }
+
+            let screenshotPixelRect = ScreenCoordinateConverter.convertAppKitGlobalRectToScreenshotPixelRect(
+                appKitGlobalRect: textItem.appKitFrame,
+                displayFrameInAppKitCoordinates: displayFrameInAppKitCoordinates,
+                screenshotWidthInPixels: CGFloat(screenshotWidthInPixels),
+                screenshotHeightInPixels: CGFloat(screenshotHeightInPixels)
+            )
+
+            let screenshotPixelOriginX = Int(screenshotPixelRect.origin.x.rounded())
+            let screenshotPixelOriginY = Int(screenshotPixelRect.origin.y.rounded())
+            let screenshotPixelWidth = Int(screenshotPixelRect.width.rounded())
+            let screenshotPixelHeight = Int(screenshotPixelRect.height.rounded())
+
+            let line = "- \(textItem.role) \"\(sanitisedText)\" (\(screenshotPixelOriginX),\(screenshotPixelOriginY) \(screenshotPixelWidth)x\(screenshotPixelHeight))"
+            return (line: line, y: screenshotPixelOriginY, x: screenshotPixelOriginX)
+        }
+        .sorted { itemA, itemB in
+            if itemA.y == itemB.y {
+                return itemA.x < itemB.x
+            }
+            return itemA.y < itemB.y
+        }
+
+        let textItemsToPrint = Array(formattedTextItems.prefix(maximumTextItemCount))
+        let remainingCount = formattedTextItems.count - textItemsToPrint.count
+
+        var lines = textItemsToPrint.map(\.line)
+        if remainingCount > 0 {
+            lines.append("… and \(remainingCount) more text items not listed")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - AX thread work (runs entirely on axSerialQueue)
 
     /// Performs the full AX walk for the given process. This function must only
@@ -645,8 +777,9 @@ final class AccessibilityElementInventoryService: ObservableObject {
         }
 
         let keptElements = walkedElements.keptElements
+        let visibleTextItems = walkedElements.visibleTextItems
 
-        if keptElements.isEmpty && walkedElements.totalVisitedCount == 0 {
+        if keptElements.isEmpty && visibleTextItems.isEmpty && walkedElements.totalVisitedCount == 0 {
             return AccessibilityElementInventory(
                 elements: [],
                 frontmostAppName: frontmostAppName,
@@ -657,6 +790,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
 
         return AccessibilityElementInventory(
             elements: keptElements,
+            visibleTextItems: visibleTextItems,
             frontmostAppName: frontmostAppName,
             frontmostAppBundleID: frontmostAppBundleID,
             captureOutcome: .captured
@@ -869,6 +1003,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
     /// containers".
     private struct WalkResult {
         let keptElements: [AccessibleElement]
+        let visibleTextItems: [AccessibleTextContent]
         let totalVisitedCount: Int
     }
 
@@ -910,6 +1045,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
         var totalVisitedCount = 0
         var nextElementID = 1
         var keptElements: [AccessibleElement] = []
+        var visibleTextItems: [AccessibleTextContent] = []
 
         // The attributes we batch-read for every element in one IPC round-trip.
         // Requesting position and size here avoids two extra round-trips per element.
@@ -991,13 +1127,20 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 }
             }
 
+            // --- Extract subrole ---
+            let subrole = batchResults[1] as? String
+
             let shouldKeep = matchesActionableRole
                 || AccessibilityElementInventoryService.shouldKeepElement(
                     role: roleString,
                     elementExposesAXPressAction: exposesAXPressAction
                 )
+            let shouldCaptureVisibleText = AccessibilityElementInventoryService.shouldCaptureVisibleText(
+                role: roleString,
+                subrole: subrole
+            )
 
-            guard shouldKeep else { continue }
+            guard shouldKeep || shouldCaptureVisibleText else { continue }
 
             // --- Extract position and size from AXValue wrappers ---
             // AXValue is a CoreFoundation type — `as? AXValue` is a conditional CF
@@ -1040,9 +1183,6 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
             )
 
-            // --- Extract subrole ---
-            let subrole = batchResults[1] as? String
-
             // --- Build title from fallback chain ---
             // Priority: kAXTitleAttribute → kAXDescriptionAttribute → kAXValueAttribute.
             // Each result is sanitised to strip newlines and square brackets.
@@ -1061,22 +1201,38 @@ final class AccessibilityElementInventoryService: ObservableObject {
             let sanitisedTitle = AccessibilityElementInventoryService.sanitiseTitleForPrompt(unsanitisedTitle)
 
             // --- Create and store the element ---
-            let accessibleElement = AccessibleElement(
-                elementID: nextElementID,
-                role: roleString,
-                subrole: subrole,
-                title: sanitisedTitle,
-                cgFrame: elementCGFrame,
-                appKitFrame: elementAppKitFrame,
-                axElementHandle: currentElement,
-                owningProcessID: processID
-            )
-            keptElements.append(accessibleElement)
-            nextElementID += 1
+            if shouldKeep {
+                let accessibleElement = AccessibleElement(
+                    elementID: nextElementID,
+                    role: roleString,
+                    subrole: subrole,
+                    title: sanitisedTitle,
+                    cgFrame: elementCGFrame,
+                    appKitFrame: elementAppKitFrame,
+                    axElementHandle: currentElement,
+                    owningProcessID: processID
+                )
+                keptElements.append(accessibleElement)
+                nextElementID += 1
+            }
+
+            if shouldCaptureVisibleText {
+                let visibleText = AccessibilityElementInventoryService.sanitiseVisibleTextForPrompt(unsanitisedTitle)
+                if !visibleText.isEmpty {
+                    let accessibleTextContent = AccessibleTextContent(
+                        role: roleString,
+                        text: visibleText,
+                        cgFrame: elementCGFrame,
+                        appKitFrame: elementAppKitFrame
+                    )
+                    visibleTextItems.append(accessibleTextContent)
+                }
+            }
         }
 
         return WalkResult(
             keptElements: keptElements,
+            visibleTextItems: visibleTextItems,
             totalVisitedCount: totalVisitedCount
         )
     }
@@ -1200,7 +1356,7 @@ final class AccessibilityElementInventoryService: ObservableObject {
             }
         }
 
-        var bestResult = WalkResult(keptElements: [], totalVisitedCount: 0)
+        var bestResult = WalkResult(keptElements: [], visibleTextItems: [], totalVisitedCount: 0)
 
         for retryIndex in 0..<AccessibilityElementInventoryService.maximumElectronWakeRetryCount {
             // Attempt 0: AXManualAccessibility (preferred, fewer side effects).
@@ -1236,12 +1392,13 @@ final class AccessibilityElementInventoryService: ObservableObject {
                 primaryScreenFrameInAppKitCoordinates: primaryScreenFrameInAppKitCoordinates
             )
 
-            if result.keptElements.count > bestResult.keptElements.count {
+            if result.keptElements.count + result.visibleTextItems.count
+                > bestResult.keptElements.count + bestResult.visibleTextItems.count {
                 bestResult = result
             }
 
             // If we found elements, no need to try the next wake method.
-            if !result.keptElements.isEmpty {
+            if !result.keptElements.isEmpty || !result.visibleTextItems.isEmpty {
                 break
             }
         }

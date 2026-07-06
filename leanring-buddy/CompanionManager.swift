@@ -925,6 +925,9 @@ final class CompanionManager: ObservableObject {
 
     fall back to the pixel-coordinate form [POINT:x,y:label:screenN] only for targets that are not in the inventory (off-screen elements, games, video content, or anything the list doesn't include). keep [POINT:none] for turns where pointing wouldn't help.
 
+    screen text context:
+    sometimes you'll also receive a section titled "visible text from the frontmost app". use it to understand or summarize readable page/document text that may be hard to read from vision alone. those lines are context only — they are not element IDs and must never be used for CLICK or TYPE tags.
+
     examples:
     - inventory present, user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. [POINT:E7:color inspector]"
     - inventory present, user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c. [POINT:E3:source control]"
@@ -2378,14 +2381,13 @@ final class CompanionManager: ObservableObject {
     /// Builds the supplemental AX inventory text block to append to a Claude message,
     /// or returns nil when no inventory is available.
     ///
-    /// The block consists of:
-    ///   1. A one-line header naming the frontmost app and describing the coordinate
-    ///      space so Claude can cross-check the list against the screenshot images.
-    ///   2. The formatted element lines from `AccessibilityElementInventoryService.formatInventoryForPrompt`.
+    /// The block can contain two sections:
+    ///   1. Actionable elements with element IDs for pointing and act mode.
+    ///   2. Visible text context without element IDs, used only for reading the page.
     ///
     /// Returns nil when:
     ///   - `inventory` is nil (no walk completed in time and no previous walk is cached)
-    ///   - The inventory's element list is empty (stub AX tree, AX-less app)
+    ///   - The inventory has neither actionable elements nor visible text
     ///
     /// Returning nil results in a message shape identical to before U4 — no extra
     /// block is added, so legacy behaviour is fully preserved for AX-less apps.
@@ -2407,7 +2409,7 @@ final class CompanionManager: ObservableObject {
         cursorScreenCapture: CompanionScreenCapture?
     ) -> String? {
         guard let inventory,
-              !inventory.elements.isEmpty,
+              (!inventory.elements.isEmpty || !inventory.visibleTextItems.isEmpty),
               let cursorCapture = cursorScreenCapture else {
             // No inventory, empty tree, or no cursor-screen capture —
             // return nil so no extra block is added to the message.
@@ -2421,17 +2423,33 @@ final class CompanionManager: ObservableObject {
             displayFrameInAppKitCoordinates: cursorCapture.displayFrame
         )
 
-        guard !formattedElementLines.isEmpty else {
-            // formatInventoryForPrompt returns an empty string for an empty list —
-            // guard here in case the element list became empty after filtering.
+        let formattedVisibleTextLines = AccessibilityElementInventoryService.formatVisibleTextForPrompt(
+            visibleTextItems: inventory.visibleTextItems,
+            screenshotWidthInPixels: cursorCapture.screenshotWidthInPixels,
+            screenshotHeightInPixels: cursorCapture.screenshotHeightInPixels,
+            displayFrameInAppKitCoordinates: cursorCapture.displayFrame
+        )
+
+        guard !formattedElementLines.isEmpty || !formattedVisibleTextLines.isEmpty else {
+            // Both formatters can return empty strings after filtering empty text.
             return nil
         }
 
-        // Header line names the app and states the coordinate space so Claude
-        // knows these frames are in the same pixel space as the screenshots.
-        let headerLine = "Interactive elements of the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space:"
+        var sections: [String] = []
 
-        return "\(headerLine)\n\(formattedElementLines)"
+        if !formattedElementLines.isEmpty {
+            // Header line names the app and states the coordinate space so Claude
+            // knows these frames are in the same pixel space as the screenshots.
+            let headerLine = "Interactive elements of the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space:"
+            sections.append("\(headerLine)\n\(formattedElementLines)")
+        }
+
+        if !formattedVisibleTextLines.isEmpty {
+            let headerLine = "Visible text from the frontmost app (\(inventory.frontmostAppName)), frames in the screenshot's pixel coordinate space. This text is context only, not clickable element IDs:"
+            sections.append("\(headerLine)\n\(formattedVisibleTextLines)")
+        }
+
+        return sections.joined(separator: "\n\n")
     }
 
     // MARK: - Walkthrough Verification System Prompt Builder

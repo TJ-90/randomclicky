@@ -161,6 +161,29 @@ struct AccessibilityElementInventoryServiceTests {
         #expect(kept == false)
     }
 
+    @Test func axStaticTextIsCapturedAsVisibleTextContext() {
+        let captured = AccessibilityElementInventoryService.shouldCaptureVisibleText(role: "AXStaticText")
+        #expect(captured == true)
+    }
+
+    @Test func axTextAreaIsCapturedAsVisibleTextContext() {
+        let captured = AccessibilityElementInventoryService.shouldCaptureVisibleText(role: "AXTextArea")
+        #expect(captured == true)
+    }
+
+    @Test func secureTextFieldIsNotCapturedAsVisibleTextContext() {
+        let captured = AccessibilityElementInventoryService.shouldCaptureVisibleText(
+            role: "AXTextField",
+            subrole: "AXSecureTextField"
+        )
+        #expect(captured == false)
+    }
+
+    @Test func axButtonIsNotCapturedAsVisibleTextContext() {
+        let captured = AccessibilityElementInventoryService.shouldCaptureVisibleText(role: "AXButton")
+        #expect(captured == false)
+    }
+
     /// Image elements are not actionable and should not be kept.
     @Test func axImageLeafRoleIsNotKept() {
         let kept = AccessibilityElementInventoryService.shouldKeepElement(
@@ -798,6 +821,27 @@ struct AccessibilityElementInventoryServiceTests {
                 "Expected 1 line for 1 element with newline-sanitised title, got \(lines.count): \(output)")
     }
 
+    @Test func visibleTextFormattingIncludesStaticTextWithoutElementID() {
+        let displayFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let visibleTextItem = buildTestVisibleTextItem(
+            role: "AXStaticText",
+            text: "Today is the third day after miscarriage. I do not feel much.",
+            cgFrame: .zero,
+            appKitFrame: CGRect(x: 100, y: 700, width: 900, height: 32)
+        )
+
+        let output = AccessibilityElementInventoryService.formatVisibleTextForPrompt(
+            visibleTextItems: [visibleTextItem],
+            screenshotWidthInPixels: 1280,
+            screenshotHeightInPixels: 800,
+            displayFrameInAppKitCoordinates: displayFrame
+        )
+
+        #expect(output.contains("AXStaticText"))
+        #expect(output.contains("Today is the third day after miscarriage"))
+        #expect(!output.contains("[E1]"))
+    }
+
     // MARK: - convertAppKitGlobalRectToScreenshotPixelRect (the new converter function)
 
     /// Verifies that a rect on the primary display at the display's centre
@@ -918,6 +962,20 @@ struct AccessibilityElementInventoryServiceTests {
             appKitFrame: appKitFrame,
             axElementHandle: placeholderAXElement,
             owningProcessID: ProcessInfo.processInfo.processIdentifier
+        )
+    }
+
+    private func buildTestVisibleTextItem(
+        role: String,
+        text: String,
+        cgFrame: CGRect,
+        appKitFrame: CGRect
+    ) -> AccessibleTextContent {
+        return AccessibleTextContent(
+            role: role,
+            text: text,
+            cgFrame: cgFrame,
+            appKitFrame: appKitFrame
         )
     }
 }

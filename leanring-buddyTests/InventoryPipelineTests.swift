@@ -123,6 +123,31 @@ struct BuildSupplementalInventoryTextBlockTests {
         #expect(lines[1].contains("[E3]"))
     }
 
+    @Test func resultContainsVisibleTextSectionWithoutElementIDs() {
+        let inventory = makeMinimalInventoryForPipelineTests(
+            appName: "Obsidian",
+            elements: [],
+            visibleTextItems: [
+                makeAccessibleTextContentForPipelineTests(
+                    role: "AXStaticText",
+                    text: "Today is the third day after miscarriage. I do not feel much.",
+                    appKitFrame: CGRect(x: 200, y: 700, width: 900, height: 32)
+                )
+            ]
+        )
+
+        let result = CompanionManager.buildSupplementalInventoryTextBlock(
+            inventory: inventory,
+            cursorScreenCapture: makeTestScreenCapture()
+        )
+
+        #expect(result != nil)
+        let resultText = result!
+        #expect(resultText.contains("Visible text from the frontmost app (Obsidian)"))
+        #expect(resultText.contains("Today is the third day after miscarriage"))
+        #expect(!resultText.contains("[E1] AXStaticText"))
+    }
+
     /// The header format must exactly match:
     ///   "Interactive elements of the frontmost app (<AppName>), frames in the screenshot's pixel coordinate space:"
     /// This is the form the system prompt teaches Claude to recognise.
@@ -299,10 +324,12 @@ struct BuildContentBlocksTests {
 private func makeMinimalInventoryForPipelineTests(
     appName: String,
     elements: [AccessibleElement],
+    visibleTextItems: [AccessibleTextContent] = [],
     captureOutcome: AccessibilityInventoryCaptureOutcome = .captured
 ) -> AccessibilityElementInventory {
     return AccessibilityElementInventory(
         elements: elements,
+        visibleTextItems: visibleTextItems,
         frontmostAppName: appName,
         frontmostAppBundleID: "com.test.\(appName.lowercased().replacingOccurrences(of: " ", with: ""))",
         captureOutcome: captureOutcome
@@ -324,6 +351,19 @@ private func makeAccessibleElementForPipelineTests(
         appKitFrame: appKitFrame,
         axElementHandle: AXUIElementCreateApplication(0),
         owningProcessID: 0
+    )
+}
+
+private func makeAccessibleTextContentForPipelineTests(
+    role: String,
+    text: String,
+    appKitFrame: CGRect
+) -> AccessibleTextContent {
+    return AccessibleTextContent(
+        role: role,
+        text: text,
+        cgFrame: .zero,
+        appKitFrame: appKitFrame
     )
 }
 
