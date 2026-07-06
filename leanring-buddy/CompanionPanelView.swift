@@ -33,6 +33,15 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
             }
 
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
+                && companionManager.walkthroughController.phase == .inactive {
+                Spacer()
+                    .frame(height: 12)
+
+                spokenResponsesSection
+                    .padding(.horizontal, 16)
+            }
+
             if !companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 16)
@@ -556,6 +565,56 @@ struct CompanionPanelView: View {
     }
 
 
+
+    // MARK: - Spoken Responses Section
+
+    private var spokenResponsesSection: some View {
+        VStack(spacing: 2) {
+            Text("VOICE")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 6)
+
+            spokenResponsesToggleRow
+        }
+    }
+
+    private var spokenResponsesToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: companionManager.isSpokenResponsesEnabled ? "speaker.wave.2" : "speaker.slash")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Spoken responses")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.isSpokenResponsesEnabled },
+                    set: { companionManager.setSpokenResponsesEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+                .pointerCursor()
+            }
+            .padding(.vertical, 4)
+
+            Text("when off, clicky still shows replies and queues confirmed actions")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 4)
+        }
+    }
 
     // MARK: - Act Mode Section (U12)
 

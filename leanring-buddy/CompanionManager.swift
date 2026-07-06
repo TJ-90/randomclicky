@@ -45,6 +45,14 @@ final class CompanionManager: ObservableObject {
     /// that would create a second source of truth.
     @Published var isActModeEnabledPublished: Bool = UserDefaults.standard.bool(forKey: "actModeEnabled")
 
+    /// Whether Clicky should speak model replies aloud. When disabled, replies
+    /// still appear in the overlay and action tags are still processed, but no
+    /// ElevenLabs/local TTS is started for normal responses.
+    @Published var isSpokenResponsesEnabled: Bool =
+        UserDefaults.standard.object(forKey: "spokenResponsesEnabled") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "spokenResponsesEnabled")
+
     /// Sets act mode on or off and persists the choice to UserDefaults.
     ///
     /// Called by the toggle binding in CompanionPanelView. Also fires the
@@ -58,6 +66,17 @@ final class CompanionManager: ObservableObject {
             ClickyAnalytics.trackActModeDisabled()
         }
         print("🎬 Act mode: \(enabled ? "enabled" : "disabled")")
+    }
+
+    /// Sets whether normal model replies are spoken aloud.
+    func setSpokenResponsesEnabled(_ enabled: Bool) {
+        isSpokenResponsesEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "spokenResponsesEnabled")
+        if !enabled {
+            elevenLabsTTSClient.stopPlayback()
+            localSpeechSynthesizer.stopSpeaking()
+        }
+        print("🔊 Spoken responses: \(enabled ? "enabled" : "disabled")")
     }
 
     // MARK: - Accessibility health state (U12 stale-TCC self-check)
@@ -1777,10 +1796,9 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a model reply. Local macOS voice when `localVoiceOutput` is set in
-    /// llm.json (fully offline, no Worker); otherwise ElevenLabs with a local
-    /// fallback if it fails (e.g. Worker out of credits). Sets voiceState to
-    /// .responding once speech begins.
+    /// Presents a model reply and, when enabled, speaks it aloud. Local macOS
+    /// voice is used when `localVoiceOutput` is set in llm.json; otherwise
+    /// ElevenLabs is used with a local fallback if it fails.
     private func speakResponse(_ text: String) async {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else {
@@ -1791,6 +1809,12 @@ final class CompanionManager: ObservableObject {
         responseOverlayManager.showOverlayAndBeginStreaming()
         responseOverlayManager.updateStreamingText(trimmedText)
         responseOverlayManager.finishStreaming()
+
+        guard isSpokenResponsesEnabled else {
+            appendDebugLog("SPEAK SKIPPED — spoken responses toggle is off, overlay shown only")
+            voiceState = .idle
+            return
+        }
 
         if LLMProviderConfiguration.loadFromDisk()?.localVoiceOutput == true {
             appendDebugLog("SPEAK local — len=\(trimmedText.count), synthesizing via NSSpeechSynthesizer")
